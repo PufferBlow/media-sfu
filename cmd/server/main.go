@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -19,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v4"
 )
@@ -48,21 +50,21 @@ type bootstrapIceServer struct {
 }
 
 type sfuBootstrapConfig struct {
-	InternalAPIBase          string               `json:"internal_api_base"`
-	InternalSecret           string               `json:"internal_secret"`
-	MaxTotalPeers            int                  `json:"max_total_peers"`
-	MaxRoomPeers             int                  `json:"max_room_peers"`
-	RoomEndGraceSeconds      int                  `json:"room_end_grace_seconds"`
-	InternalEventWorkers     int                  `json:"internal_event_workers"`
-	InternalEventQueueSize   int                  `json:"internal_event_queue_size"`
-	InternalHTTPTimeoutSec   int                  `json:"internal_http_timeout_seconds"`
-	WSWriteTimeoutSec        int                  `json:"ws_write_timeout_seconds"`
-	WSPingIntervalSec        int                  `json:"ws_ping_interval_seconds"`
-	WSPongWaitSec            int                  `json:"ws_pong_wait_seconds"`
-	WSReadLimitBytes         int                  `json:"ws_read_limit_bytes"`
-	UDPPortMin               int                  `json:"udp_port_min"`
-	UDPPortMax               int                  `json:"udp_port_max"`
-	IceServers               []bootstrapIceServer `json:"ice_servers"`
+	InternalAPIBase        string               `json:"internal_api_base"`
+	InternalSecret         string               `json:"internal_secret"`
+	MaxTotalPeers          int                  `json:"max_total_peers"`
+	MaxRoomPeers           int                  `json:"max_room_peers"`
+	RoomEndGraceSeconds    int                  `json:"room_end_grace_seconds"`
+	InternalEventWorkers   int                  `json:"internal_event_workers"`
+	InternalEventQueueSize int                  `json:"internal_event_queue_size"`
+	InternalHTTPTimeoutSec int                  `json:"internal_http_timeout_seconds"`
+	WSWriteTimeoutSec      int                  `json:"ws_write_timeout_seconds"`
+	WSPingIntervalSec      int                  `json:"ws_ping_interval_seconds"`
+	WSPongWaitSec          int                  `json:"ws_pong_wait_seconds"`
+	WSReadLimitBytes       int                  `json:"ws_read_limit_bytes"`
+	UDPPortMin             int                  `json:"udp_port_min"`
+	UDPPortMax             int                  `json:"udp_port_max"`
+	IceServers             []bootstrapIceServer `json:"ice_servers"`
 }
 
 type bootstrapConfigResponse struct {
@@ -175,6 +177,50 @@ type roomMetric struct {
 	Peers     int    `json:"peers"`
 }
 
+// MediaSFUConfig represents the [media-sfu] section from config.toml
+type MediaSFUConfig struct {
+	BootstrapConfigURL    string `toml:"bootstrap_config_url"`
+	BootstrapSecret       string `toml:"bootstrap_secret"`
+	BindAddr              string `toml:"bind_addr"`
+	BootstrapHTTPTimeout  string `toml:"bootstrap_http_timeout"`
+	MaxTotalPeers         int    `toml:"max_total_peers"`
+	MaxRoomPeers          int    `toml:"max_room_peers"`
+	RoomEndGraceSeconds   int    `toml:"room_end_grace_seconds"`
+	EventWorkers          int    `toml:"event_workers"`
+	EventQueueSize        int    `toml:"event_queue_size"`
+	HTTPTimeoutSeconds    int    `toml:"http_timeout_seconds"`
+	WSWriteTimeoutSeconds int    `toml:"ws_write_timeout_seconds"`
+	WSPingIntervalSeconds int    `toml:"ws_ping_interval_seconds"`
+	WSPongWaitSeconds     int    `toml:"ws_pong_wait_seconds"`
+	WSReadLimitBytes      int    `toml:"ws_read_limit_bytes"`
+	UDPPortMin            int    `toml:"udp_port_min"`
+	UDPPortMax            int    `toml:"udp_port_max"`
+}
+
+// TOMLConfig represents the overall structure of config.toml
+type TOMLConfig struct {
+	MediaSFU MediaSFUConfig `toml:"media-sfu"`
+}
+
+// loadConfigFromTOML reads and parses the config.toml file
+func loadConfigFromTOML(filePath string) (*MediaSFUConfig, error) {
+	if filePath == "" {
+		return &MediaSFUConfig{}, nil // Return empty config if no path provided
+	}
+
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	var cfg TOMLConfig
+	if err := toml.Unmarshal(content, &cfg); err != nil {
+		return nil, fmt.Errorf("failed to parse config file: %w", err)
+	}
+
+	return &cfg.MediaSFU, nil
+}
+
 type sfuServer struct {
 	bindAddr        string
 	internalAPIBase string
@@ -207,19 +253,107 @@ type sfuServer struct {
 	droppedInternalEvents atomic.Int64
 }
 
-func newServer() (*sfuServer, error) {
+func newServer(configPath string) (*sfuServer, error) {
+	// Load config from TOML file if provided
+	var tomlConfig *MediaSFUConfig
+	if configPath != "" {
+		cfg, err := loadConfigFromTOML(configPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load config.toml: %w", err)
+		}
+		tomlConfig = cfg
+	} else {
+		tomlConfig = &MediaSFUConfig{}
+	}
+
+	// Helper to get config value, preferring TOML > env var > fallback
+	getStringConfig := func(tomlVal, envKey, fallback string) string {
+		if tomlVal != "" {
+			return tomlVal
+		}
+		return envOrDefault(envKey, fallback)
+	}
+
+	getIntConfig := func(tomlVal int, envKey string, fallback int) int {
+		if tomlVal > 0 {
+			return tomlVal
+		}
+		envVal := envIntOrDefault(envKey, fallback)
+		if envVal > 0 {
+			return envVal
+		}
+		return fallback
+	}
+
+	getDurationConfig := func(tomlVal string, envKey string, fallback time.Duration) time.Duration {
+		if tomlVal != "" {
+			if d, err := time.ParseDuration(tomlVal); err == nil {
+				return d
+			}
+		}
+		return envDurationOrDefault(envKey, fallback)
+	}
+
+	// Determine bind address
+	bindAddr := getStringConfig(tomlConfig.BindAddr, "RTC_BIND_ADDR", ":8787")
+
+	// Determine resource limits and timeouts
+	maxTotalPeers := getIntConfig(tomlConfig.MaxTotalPeers, "RTC_MAX_TOTAL_PEERS", 200)
+	maxRoomPeers := getIntConfig(tomlConfig.MaxRoomPeers, "RTC_MAX_ROOM_PEERS", 60)
+	roomEndGraceSeconds := getIntConfig(tomlConfig.RoomEndGraceSeconds, "RTC_ROOM_END_GRACE_SECONDS", 15)
+	eventWorkers := getIntConfig(tomlConfig.EventWorkers, "RTC_EVENT_WORKERS", 4)
+	eventQueueSize := getIntConfig(tomlConfig.EventQueueSize, "RTC_EVENT_QUEUE_SIZE", 4096)
+
+	writeTimeout := getDurationConfig(
+		func() string {
+			if tomlConfig.WSWriteTimeoutSeconds > 0 {
+				return fmt.Sprintf("%ds", tomlConfig.WSWriteTimeoutSeconds)
+			}
+			return ""
+		}(),
+		"RTC_WS_WRITE_TIMEOUT",
+		4*time.Second,
+	)
+	pingInterval := getDurationConfig(
+		func() string {
+			if tomlConfig.WSPingIntervalSeconds > 0 {
+				return fmt.Sprintf("%ds", tomlConfig.WSPingIntervalSeconds)
+			}
+			return ""
+		}(),
+		"RTC_WS_PING_INTERVAL",
+		20*time.Second,
+	)
+	pongWait := getDurationConfig(
+		func() string {
+			if tomlConfig.WSPongWaitSeconds > 0 {
+				return fmt.Sprintf("%ds", tomlConfig.WSPongWaitSeconds)
+			}
+			return ""
+		}(),
+		"RTC_WS_PONG_WAIT",
+		45*time.Second,
+	)
+
+	readLimit := int64(1024 * 1024)
+	if tomlConfig.WSReadLimitBytes > 0 {
+		readLimit = int64(tomlConfig.WSReadLimitBytes)
+	}
+
+	httpTimeout := time.Duration(getIntConfig(tomlConfig.HTTPTimeoutSeconds, "RTC_HTTP_TIMEOUT_SECONDS", 5)) * time.Second
+
 	server := &sfuServer{
-		bindAddr:      envOrDefault("RTC_BIND_ADDR", ":8787"),
-		maxTotalPeers: 200,
-		maxRoomPeers:  60,
-		roomEndGrace:  15 * time.Second,
-		readLimit:     int64(1024 * 1024),
-		writeTimeout:  4 * time.Second,
-		pingInterval:  20 * time.Second,
-		pongWait:      45 * time.Second,
-		eventWorkers:  4,
-		eventQueue:    make(chan internalEvent, 4096),
-		httpClient:    &http.Client{Timeout: 5 * time.Second},
+		bindAddr:      bindAddr,
+		maxTotalPeers: maxTotalPeers,
+		maxRoomPeers:  maxRoomPeers,
+		roomEndGrace:  time.Duration(roomEndGraceSeconds) * time.Second,
+		readLimit:     readLimit,
+		writeTimeout:  writeTimeout,
+		pingInterval:  pingInterval,
+		pongWait:      pongWait,
+		eventWorkers:  eventWorkers,
+		eventQueue:    make(chan internalEvent, eventQueueSize),
+		httpClient:    &http.Client{Timeout: httpTimeout},
 		rooms:         map[string]*room{},
 		roomEnd:       map[string]*time.Timer{},
 		upgrader: websocket.Upgrader{
@@ -231,15 +365,20 @@ func newServer() (*sfuServer, error) {
 		},
 	}
 
-	bootstrapURL := strings.TrimRight(
-		envOrDefault("RTC_BOOTSTRAP_CONFIG_URL", "http://localhost:7575/api/internal/v1/voice/bootstrap-config"),
-		"/",
+	bootstrapURL := getStringConfig(
+		tomlConfig.BootstrapConfigURL,
+		"RTC_BOOTSTRAP_CONFIG_URL",
+		"http://localhost:7575/api/internal/v1/voice/bootstrap-config",
 	)
-	bootstrapSecret := strings.TrimSpace(envOrDefault("RTC_BOOTSTRAP_SECRET", ""))
+	bootstrapURL = strings.TrimRight(bootstrapURL, "/")
+
+	bootstrapSecret := getStringConfig(tomlConfig.BootstrapSecret, "RTC_BOOTSTRAP_SECRET", "")
+	bootstrapSecret = strings.TrimSpace(bootstrapSecret)
 	if bootstrapSecret == "" {
-		return nil, errors.New("RTC_BOOTSTRAP_SECRET is required")
+		return nil, errors.New("RTC_BOOTSTRAP_SECRET is required (set in config.toml [media-sfu] section or RTC_BOOTSTRAP_SECRET env var)")
 	}
-	bootstrapHTTPTimeout := envDurationOrDefault("RTC_BOOTSTRAP_HTTP_TIMEOUT", 5*time.Second)
+
+	bootstrapHTTPTimeout := getDurationConfig(tomlConfig.BootstrapHTTPTimeout, "RTC_BOOTSTRAP_HTTP_TIMEOUT", 5*time.Second)
 
 	bootstrapClient := &http.Client{Timeout: bootstrapHTTPTimeout}
 	bootstrapCfg, err := fetchBootstrapConfig(
@@ -1072,7 +1211,10 @@ func (s *sfuServer) handleWS(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	server, err := newServer()
+	configPath := flag.String("config", "", "Path to config.toml file")
+	flag.Parse()
+
+	server, err := newServer(*configPath)
 	if err != nil {
 		log.Fatalf("failed to initialize media-sfu: %v", err)
 	}
