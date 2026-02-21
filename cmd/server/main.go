@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -38,6 +39,36 @@ type consumeTokenResponse struct {
 	StatusCode int        `json:"status_code"`
 	Claims     joinClaims `json:"claims"`
 	Detail     string     `json:"detail"`
+}
+
+type bootstrapIceServer struct {
+	URLs       any    `json:"urls"`
+	Username   string `json:"username"`
+	Credential string `json:"credential"`
+}
+
+type sfuBootstrapConfig struct {
+	InternalAPIBase          string               `json:"internal_api_base"`
+	InternalSecret           string               `json:"internal_secret"`
+	MaxTotalPeers            int                  `json:"max_total_peers"`
+	MaxRoomPeers             int                  `json:"max_room_peers"`
+	RoomEndGraceSeconds      int                  `json:"room_end_grace_seconds"`
+	InternalEventWorkers     int                  `json:"internal_event_workers"`
+	InternalEventQueueSize   int                  `json:"internal_event_queue_size"`
+	InternalHTTPTimeoutSec   int                  `json:"internal_http_timeout_seconds"`
+	WSWriteTimeoutSec        int                  `json:"ws_write_timeout_seconds"`
+	WSPingIntervalSec        int                  `json:"ws_ping_interval_seconds"`
+	WSPongWaitSec            int                  `json:"ws_pong_wait_seconds"`
+	WSReadLimitBytes         int                  `json:"ws_read_limit_bytes"`
+	UDPPortMin               int                  `json:"udp_port_min"`
+	UDPPortMax               int                  `json:"udp_port_max"`
+	IceServers               []bootstrapIceServer `json:"ice_servers"`
+}
+
+type bootstrapConfigResponse struct {
+	StatusCode int                `json:"status_code"`
+	Config     sfuBootstrapConfig `json:"config"`
+	Detail     string             `json:"detail"`
 }
 
 type signalMessage struct {
@@ -151,6 +182,7 @@ type sfuServer struct {
 
 	maxTotalPeers int
 	maxRoomPeers  int
+	roomEndGrace  time.Duration
 
 	readLimit    int64
 	writeTimeout time.Duration
@@ -166,6 +198,7 @@ type sfuServer struct {
 
 	roomsMu sync.RWMutex
 	rooms   map[string]*room
+	roomEnd map[string]*time.Timer
 
 	upgrader websocket.Upgrader
 
@@ -174,51 +207,21 @@ type sfuServer struct {
 	droppedInternalEvents atomic.Int64
 }
 
-func newServer() *sfuServer {
-	minUDPPort := envIntOrDefault("RTC_UDP_PORT_MIN", 50000)
-	maxUDPPort := envIntOrDefault("RTC_UDP_PORT_MAX", 50199)
-	settingEngine := webrtc.SettingEngine{}
-	if minUDPPort > 0 && maxUDPPort >= minUDPPort && maxUDPPort <= 65535 {
-		if err := settingEngine.SetEphemeralUDPPortRange(uint16(minUDPPort), uint16(maxUDPPort)); err != nil {
-			log.Printf("failed setting UDP port range (%d-%d): %v", minUDPPort, maxUDPPort, err)
-		}
-	}
-
-	readLimit := int64(envIntOrDefault("RTC_WS_READ_LIMIT_BYTES", 1024*1024))
-	writeTimeout := envDurationOrDefault("RTC_WS_WRITE_TIMEOUT", 4*time.Second)
-	pongWait := envDurationOrDefault("RTC_WS_PONG_WAIT", 45*time.Second)
-	pingInterval := envDurationOrDefault("RTC_WS_PING_INTERVAL", 20*time.Second)
-	if pingInterval >= pongWait {
-		pingInterval = pongWait / 2
-	}
-
-	internalTimeout := envDurationOrDefault("RTC_INTERNAL_HTTP_TIMEOUT", 5*time.Second)
-	eventWorkers := envIntOrDefault("RTC_INTERNAL_EVENT_WORKERS", 4)
-	if eventWorkers < 1 {
-		eventWorkers = 1
-	}
-
-	eventQueueSize := envIntOrDefault("RTC_INTERNAL_EVENT_QUEUE_SIZE", 4096)
-	if eventQueueSize < 32 {
-		eventQueueSize = 32
-	}
-
-	return &sfuServer{
-		bindAddr:        envOrDefault("RTC_BIND_ADDR", ":8787"),
-		internalAPIBase: strings.TrimRight(envOrDefault("RTC_INTERNAL_API_BASE", "http://localhost:7575/api/internal/v1/voice"), "/"),
-		internalSecret:  envOrDefault("RTC_INTERNAL_SECRET", ""),
-		maxTotalPeers:   envIntOrDefault("RTC_MAX_TOTAL_PEERS", 200),
-		maxRoomPeers:    envIntOrDefault("RTC_MAX_ROOM_PEERS", 60),
-		readLimit:       readLimit,
-		writeTimeout:    writeTimeout,
-		pingInterval:    pingInterval,
-		pongWait:        pongWait,
-		eventWorkers:    eventWorkers,
-		eventQueue:      make(chan internalEvent, eventQueueSize),
-		httpClient:      &http.Client{Timeout: internalTimeout},
-		webrtcAPI:       webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine)),
-		iceServers:      parseIceServers(),
-		rooms:           map[string]*room{},
+func newServer() (*sfuServer, error) {
+	server := &sfuServer{
+		bindAddr:      envOrDefault("RTC_BIND_ADDR", ":8787"),
+		maxTotalPeers: 200,
+		maxRoomPeers:  60,
+		roomEndGrace:  15 * time.Second,
+		readLimit:     int64(1024 * 1024),
+		writeTimeout:  4 * time.Second,
+		pingInterval:  20 * time.Second,
+		pongWait:      45 * time.Second,
+		eventWorkers:  4,
+		eventQueue:    make(chan internalEvent, 4096),
+		httpClient:    &http.Client{Timeout: 5 * time.Second},
+		rooms:         map[string]*room{},
+		roomEnd:       map[string]*time.Timer{},
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  4096,
 			WriteBufferSize: 4096,
@@ -227,6 +230,93 @@ func newServer() *sfuServer {
 			},
 		},
 	}
+
+	bootstrapURL := strings.TrimRight(
+		envOrDefault("RTC_BOOTSTRAP_CONFIG_URL", "http://localhost:7575/api/internal/v1/voice/bootstrap-config"),
+		"/",
+	)
+	bootstrapSecret := strings.TrimSpace(envOrDefault("RTC_BOOTSTRAP_SECRET", ""))
+	if bootstrapSecret == "" {
+		return nil, errors.New("RTC_BOOTSTRAP_SECRET is required")
+	}
+	bootstrapHTTPTimeout := envDurationOrDefault("RTC_BOOTSTRAP_HTTP_TIMEOUT", 5*time.Second)
+
+	bootstrapClient := &http.Client{Timeout: bootstrapHTTPTimeout}
+	bootstrapCfg, err := fetchBootstrapConfig(
+		bootstrapClient,
+		bootstrapURL,
+		bootstrapSecret,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("bootstrap config fetch failed: %w", err)
+	}
+
+	if strings.TrimSpace(bootstrapCfg.InternalAPIBase) == "" {
+		return nil, errors.New("bootstrap config missing internal_api_base")
+	}
+	if strings.TrimSpace(bootstrapCfg.InternalSecret) == "" {
+		return nil, errors.New("bootstrap config missing internal_secret")
+	}
+
+	server.internalAPIBase = strings.TrimRight(bootstrapCfg.InternalAPIBase, "/")
+	server.internalSecret = bootstrapCfg.InternalSecret
+
+	if bootstrapCfg.MaxTotalPeers > 0 {
+		server.maxTotalPeers = bootstrapCfg.MaxTotalPeers
+	}
+	if bootstrapCfg.MaxRoomPeers > 0 {
+		server.maxRoomPeers = bootstrapCfg.MaxRoomPeers
+	}
+	if bootstrapCfg.RoomEndGraceSeconds > 0 {
+		server.roomEndGrace = time.Duration(bootstrapCfg.RoomEndGraceSeconds) * time.Second
+	}
+	if bootstrapCfg.InternalEventWorkers > 0 {
+		server.eventWorkers = bootstrapCfg.InternalEventWorkers
+	}
+	if bootstrapCfg.InternalEventQueueSize >= 32 {
+		server.eventQueue = make(chan internalEvent, bootstrapCfg.InternalEventQueueSize)
+	}
+	if bootstrapCfg.InternalHTTPTimeoutSec > 0 {
+		server.httpClient = &http.Client{
+			Timeout: time.Duration(bootstrapCfg.InternalHTTPTimeoutSec) * time.Second,
+		}
+	}
+	if bootstrapCfg.WSWriteTimeoutSec > 0 {
+		server.writeTimeout = time.Duration(bootstrapCfg.WSWriteTimeoutSec) * time.Second
+	}
+	if bootstrapCfg.WSPongWaitSec > 0 {
+		server.pongWait = time.Duration(bootstrapCfg.WSPongWaitSec) * time.Second
+	}
+	if bootstrapCfg.WSPingIntervalSec > 0 {
+		server.pingInterval = time.Duration(bootstrapCfg.WSPingIntervalSec) * time.Second
+	}
+	if server.pingInterval >= server.pongWait {
+		server.pingInterval = server.pongWait / 2
+	}
+	if bootstrapCfg.WSReadLimitBytes > 0 {
+		server.readLimit = int64(bootstrapCfg.WSReadLimitBytes)
+	}
+
+	minUDPPort := bootstrapCfg.UDPPortMin
+	maxUDPPort := bootstrapCfg.UDPPortMax
+	if minUDPPort <= 0 {
+		minUDPPort = 50000
+	}
+	if maxUDPPort <= 0 {
+		maxUDPPort = 50199
+	}
+
+	settingEngine := webrtc.SettingEngine{}
+	if minUDPPort > 0 && maxUDPPort >= minUDPPort && maxUDPPort <= 65535 {
+		if err := settingEngine.SetEphemeralUDPPortRange(uint16(minUDPPort), uint16(maxUDPPort)); err != nil {
+			log.Printf("failed setting UDP port range (%d-%d): %v", minUDPPort, maxUDPPort, err)
+		}
+	}
+
+	server.iceServers = parseBootstrapIceServers(bootstrapCfg.IceServers)
+	server.webrtcAPI = webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine))
+
+	return server, nil
 }
 
 func envOrDefault(key, fallback string) string {
@@ -265,33 +355,88 @@ func envDurationOrDefault(key string, fallback time.Duration) time.Duration {
 	return parsed
 }
 
-func parseIceServers() []webrtc.ICEServer {
-	raw := strings.TrimSpace(os.Getenv("RTC_ICE_SERVERS"))
-	if raw == "" {
-		return nil
-	}
-
-	username := strings.TrimSpace(os.Getenv("RTC_ICE_USERNAME"))
-	credential := strings.TrimSpace(os.Getenv("RTC_ICE_CREDENTIAL"))
-
-	entries := strings.Split(raw, ",")
+func parseBootstrapIceServers(entries []bootstrapIceServer) []webrtc.ICEServer {
 	servers := make([]webrtc.ICEServer, 0, len(entries))
 	for _, entry := range entries {
-		url := strings.TrimSpace(entry)
-		if url == "" {
+		urls := make([]string, 0, 2)
+		switch value := entry.URLs.(type) {
+		case string:
+			if strings.TrimSpace(value) != "" {
+				urls = append(urls, strings.TrimSpace(value))
+			}
+		case []any:
+			for _, item := range value {
+				if asString, ok := item.(string); ok && strings.TrimSpace(asString) != "" {
+					urls = append(urls, strings.TrimSpace(asString))
+				}
+			}
+		}
+
+		if len(urls) == 0 {
 			continue
 		}
 
-		server := webrtc.ICEServer{URLs: []string{url}}
-		if username != "" {
-			server.Username = username
+		server := webrtc.ICEServer{
+			URLs: urls,
 		}
-		if credential != "" {
-			server.Credential = credential
+		if strings.TrimSpace(entry.Username) != "" {
+			server.Username = entry.Username
+		}
+		if strings.TrimSpace(entry.Credential) != "" {
+			server.Credential = entry.Credential
 		}
 		servers = append(servers, server)
 	}
 	return servers
+}
+
+func signBootstrapPayload(secret string, timestamp int64, nonce string, body []byte) string {
+	payload := []byte(fmt.Sprintf("%d.%s.", timestamp, nonce))
+	payload = append(payload, body...)
+
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(payload)
+	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
+}
+
+func fetchBootstrapConfig(client *http.Client, endpoint string, secret string) (*sfuBootstrapConfig, error) {
+	nonceBytes := make([]byte, 16)
+	if _, err := rand.Read(nonceBytes); err != nil {
+		return nil, fmt.Errorf("nonce generation failed: %w", err)
+	}
+	nonce := hex.EncodeToString(nonceBytes)
+	timestamp := time.Now().UTC().Unix()
+	body, _ := json.Marshal(map[string]any{
+		"service": "media-sfu",
+		"nonce":   nonce,
+	})
+
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Pufferblow-Timestamp", strconv.FormatInt(timestamp, 10))
+	req.Header.Set("X-Pufferblow-Nonce", nonce)
+	req.Header.Set("X-Pufferblow-Signature", signBootstrapPayload(secret, timestamp, nonce, body))
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status=%d body=%s", resp.StatusCode, string(respBody))
+	}
+
+	var decoded bootstrapConfigResponse
+	if err := json.Unmarshal(respBody, &decoded); err != nil {
+		return nil, err
+	}
+
+	return &decoded.Config, nil
 }
 
 func (s *sfuServer) healthz(w http.ResponseWriter, _ *http.Request) {
@@ -315,6 +460,7 @@ func (s *sfuServer) metrics(w http.ResponseWriter, _ *http.Request) {
 		"total_peers":              s.totalPeers.Load(),
 		"max_total_peers":          s.maxTotalPeers,
 		"max_room_peers":           s.maxRoomPeers,
+		"room_end_grace_seconds":   int(s.roomEndGrace.Seconds()),
 		"rejected_connections":     s.rejectedConnections.Load(),
 		"dropped_internal_events":  s.droppedInternalEvents.Load(),
 		"internal_event_workers":   s.eventWorkers,
@@ -350,8 +496,61 @@ func (s *sfuServer) deleteRoomIfEmpty(r *room) {
 		return
 	}
 
+	var timer *time.Timer
 	s.roomsMu.Lock()
 	delete(s.rooms, r.SessionID)
+	timer = s.roomEnd[r.SessionID]
+	delete(s.roomEnd, r.SessionID)
+	s.roomsMu.Unlock()
+	if timer != nil {
+		timer.Stop()
+	}
+}
+
+func (s *sfuServer) cancelRoomEndTimer(sessionID string) {
+	var timer *time.Timer
+	s.roomsMu.Lock()
+	timer = s.roomEnd[sessionID]
+	delete(s.roomEnd, sessionID)
+	s.roomsMu.Unlock()
+	if timer != nil {
+		timer.Stop()
+	}
+}
+
+func (s *sfuServer) scheduleRoomEndGrace(r *room) {
+	if r.peerCount() > 0 {
+		s.cancelRoomEndTimer(r.SessionID)
+		return
+	}
+
+	if s.roomEndGrace <= 0 {
+		s.emitInternalEvent("session_ended", map[string]any{
+			"session_id": r.SessionID,
+			"channel_id": r.ChannelID,
+			"reason":     "empty",
+		})
+		s.deleteRoomIfEmpty(r)
+		return
+	}
+
+	s.cancelRoomEndTimer(r.SessionID)
+
+	timer := time.AfterFunc(s.roomEndGrace, func() {
+		if r.peerCount() > 0 {
+			return
+		}
+
+		s.emitInternalEvent("session_ended", map[string]any{
+			"session_id": r.SessionID,
+			"channel_id": r.ChannelID,
+			"reason":     "empty_grace_timeout",
+		})
+		s.deleteRoomIfEmpty(r)
+	})
+
+	s.roomsMu.Lock()
+	s.roomEnd[r.SessionID] = timer
 	s.roomsMu.Unlock()
 }
 
@@ -593,12 +792,7 @@ func (s *sfuServer) removePeer(r *room, p *peer, reason string) {
 	}, p.UserID)
 
 	if remaining == 0 {
-		s.emitInternalEvent("session_ended", map[string]any{
-			"session_id": r.SessionID,
-			"channel_id": r.ChannelID,
-			"reason":     "empty",
-		})
-		s.deleteRoomIfEmpty(r)
+		s.scheduleRoomEndGrace(r)
 	}
 }
 
@@ -649,6 +843,7 @@ func (s *sfuServer) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	roomObj := s.getOrCreateRoom(claims.SessionID, claims.ChannelID)
+	s.cancelRoomEndTimer(claims.SessionID)
 	if s.maxRoomPeers > 0 && roomObj.peerCount() >= s.maxRoomPeers {
 		s.rejectedConnections.Add(1)
 		s.releasePeerSlot()
@@ -877,9 +1072,9 @@ func (s *sfuServer) handleWS(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	server := newServer()
-	if strings.TrimSpace(server.internalSecret) == "" {
-		log.Fatal("RTC_INTERNAL_SECRET is required")
+	server, err := newServer()
+	if err != nil {
+		log.Fatalf("failed to initialize media-sfu: %v", err)
 	}
 	server.startEventWorkers()
 
@@ -896,10 +1091,11 @@ func main() {
 	}
 
 	log.Printf(
-		"media-sfu listening on %s (max_total_peers=%d max_room_peers=%d workers=%d)",
+		"media-sfu listening on %s (max_total_peers=%d max_room_peers=%d room_end_grace=%s workers=%d)",
 		server.bindAddr,
 		server.maxTotalPeers,
 		server.maxRoomPeers,
+		server.roomEndGrace,
 		server.eventWorkers,
 	)
 	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

@@ -44,7 +44,7 @@ SFU -> Client:
 
 ## Internal API callbacks (to Pufferblow server)
 
-Configured with `RTC_INTERNAL_API_BASE`.
+Configured from server-provided bootstrap config at startup.
 
 - `POST /consume-join-token`
 - `POST /events`
@@ -63,6 +63,8 @@ This service is tuned for a practical first target of **100+ concurrent audio cl
   - `RTC_INTERNAL_EVENT_QUEUE_SIZE`
 - websocket keepalive and safety:
   - read limit, ping/pong timers, write timeout
+- reconnect grace window for empty rooms:
+  - `RTC_ROOM_END_GRACE` (default `15s`)
 - fixed UDP port range for predictable infra/networking:
   - `RTC_UDP_PORT_MIN`
   - `RTC_UDP_PORT_MAX`
@@ -72,30 +74,11 @@ This service is tuned for a practical first target of **100+ concurrent audio cl
 
 Core:
 - `RTC_BIND_ADDR` (default `:8787`)
-- `RTC_INTERNAL_API_BASE` (default `http://localhost:7575/api/internal/v1/voice`)
-- `RTC_INTERNAL_SECRET` (required)
+- `RTC_BOOTSTRAP_CONFIG_URL` (default `http://localhost:7575/api/internal/v1/voice/bootstrap-config`)
+- `RTC_BOOTSTRAP_SECRET` (required)
+- `RTC_BOOTSTRAP_HTTP_TIMEOUT` (default `5s`)
 
-Capacity:
-- `RTC_MAX_TOTAL_PEERS` (default `200`)
-- `RTC_MAX_ROOM_PEERS` (default `60`)
-
-Internal events:
-- `RTC_INTERNAL_EVENT_WORKERS` (default `4`)
-- `RTC_INTERNAL_EVENT_QUEUE_SIZE` (default `4096`)
-- `RTC_INTERNAL_HTTP_TIMEOUT` (default `5s`)
-
-WebSocket/IO:
-- `RTC_WS_WRITE_TIMEOUT` (default `4s`)
-- `RTC_WS_PING_INTERVAL` (default `20s`)
-- `RTC_WS_PONG_WAIT` (default `45s`)
-- `RTC_WS_READ_LIMIT_BYTES` (default `1048576`)
-
-ICE/Network:
-- `RTC_ICE_SERVERS` (comma-separated)
-- `RTC_ICE_USERNAME` (optional)
-- `RTC_ICE_CREDENTIAL` (optional)
-- `RTC_UDP_PORT_MIN` (default `50000`)
-- `RTC_UDP_PORT_MAX` (default `50199`)
+All operational settings (ICE servers, internal callback secret/base, queue/timeouts, peer limits, UDP range) are fetched securely from the server runtime config.
 
 ## Local Run
 
@@ -109,8 +92,8 @@ go run ./cmd/server
 ```bash
 docker build -t pufferblow-media-sfu .
 docker run --rm -p 8787:8787 \
-  -e RTC_INTERNAL_SECRET=change-me \
-  -e RTC_INTERNAL_API_BASE=http://host.docker.internal:7575/api/internal/v1/voice \
+  -e RTC_BOOTSTRAP_SECRET=change-me \
+  -e RTC_BOOTSTRAP_CONFIG_URL=http://host.docker.internal:7575/api/internal/v1/voice/bootstrap-config \
   pufferblow-media-sfu
 ```
 
