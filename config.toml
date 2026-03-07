@@ -1,0 +1,101 @@
+# ─────────────────────────────────────────────────────────────
+# Pufferblow media-sfu configuration
+# All settings live here. No environment variables are read.
+# Run with: ./media-sfu -config /path/to/config.toml
+# ─────────────────────────────────────────────────────────────
+
+[media-sfu]
+
+# ── Bootstrap ─────────────────────────────────────────────────
+# URL of the Pufferblow backend's internal bootstrap endpoint.
+# The SFU calls this on startup to receive its runtime config
+# (internal API base URL, internal secret, ICE servers, etc.).
+bootstrap_config_url = "http://localhost:7575/api/internal/v1/voice/bootstrap-config"
+
+# Shared secret used to sign the bootstrap request.
+# Must match the value configured in the Pufferblow backend.
+# Required — the SFU will refuse to start without this.
+bootstrap_secret = "change-me"
+
+# How long to wait for the bootstrap HTTP response before timing out.
+# Use Go duration syntax: "5s", "10s", "30s"
+bootstrap_http_timeout = "5s"
+
+# How many times to retry the bootstrap request before giving up.
+# Useful when the SFU starts before the backend is ready.
+bootstrap_max_retries = 10
+
+# Delay between bootstrap retry attempts.
+bootstrap_retry_delay = "3s"
+
+
+# ── Network ───────────────────────────────────────────────────
+# Address and port the SFU WebSocket server listens on.
+# Clients connect here for WebRTC signalling.
+bind_addr = ":8787"
+
+# UDP port range allocated to WebRTC peer connections.
+# Range must be large enough for max_total_peers simultaneous connections.
+# For 1000 peers, 2000 ports provides comfortable headroom.
+udp_port_min = 50000
+udp_port_max = 51999
+
+
+# ── Capacity ──────────────────────────────────────────────────
+# Maximum number of WebRTC peers connected to this SFU at once
+# across all rooms combined.
+max_total_peers = 1000
+
+# Maximum number of peers allowed in a single voice channel room.
+# Clients receive "voice room is full" if this is exceeded.
+max_room_peers = 100
+
+# How long (in seconds) to keep a room alive after the last peer leaves,
+# before emitting session_ended and cleaning up. Allows brief disconnects
+# to rejoin the same session without a new room being created.
+room_end_grace_seconds = 15
+
+
+# ── Internal event workers ────────────────────────────────────
+# Number of goroutines that process the internal event queue and
+# POST events to the Pufferblow backend (participant_joined,
+# participant_left, state_changed, session_ended).
+# Defaults to runtime.NumCPU() * 2 if set to 0.
+event_workers = 0
+
+# Capacity of the internal event queue channel.
+# If this fills up, events are dropped and counted in /metrics.
+event_queue_size = 8192
+
+
+# ── HTTP client (backend calls) ───────────────────────────────
+# Timeout for HTTP requests made by the SFU to the Pufferblow
+# backend (token validation, event posting).
+http_timeout_seconds = 5
+
+
+# ── WebSocket tuning ──────────────────────────────────────────
+# Maximum duration to wait for a WebSocket write to complete.
+ws_write_timeout_seconds = 4
+
+# How often to send WebSocket ping frames to connected clients.
+ws_ping_interval_seconds = 20
+
+# How long to wait for a pong response before considering the
+# connection dead and closing it. Must be greater than ping interval.
+ws_pong_wait_seconds = 45
+
+# Maximum size of a single incoming WebSocket message in bytes.
+# Protects against oversized signalling payloads.
+ws_read_limit_bytes = 1048576  # 1 MB
+
+
+# ── Observability ─────────────────────────────────────────────
+# Log verbosity level: "debug", "info", "warn", "error"
+# All output is structured JSON to stdout.
+log_level = "info"
+
+# If set, the /metrics endpoint requires a valid X-Pufferblow-Signature
+# header. Leave empty to allow unauthenticated access (suitable if the
+# SFU port is not publicly reachable).
+metrics_secret = ""
