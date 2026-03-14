@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -44,9 +45,10 @@ const version = "0.2.0"
 // what the peer is allowed to do in this session.
 //
 // Scope values (space-separated, any combination):
-//   send_audio   – peer may publish microphone audio
-//   send_video   – peer may publish camera / screenshare video
-//   recv         – peer may subscribe to other participants' tracks
+//
+//	send_audio   – peer may publish microphone audio
+//	send_video   – peer may publish camera / screenshare video
+//	recv         – peer may subscribe to other participants' tracks
 type joinClaims struct {
 	Sub        string `json:"sub"`         // user UUID
 	Username   string `json:"username"`    // display name for participant list
@@ -82,22 +84,53 @@ type bootstrapIceServer struct {
 	Credential string `json:"credential"`
 }
 
+type profileBitrate struct {
+	BitrateKbps int `json:"bitrate_kbps"`
+}
+
+type videoProfile struct {
+	BitrateKbps int `json:"bitrate_kbps"`
+	Width       int `json:"width"`
+	Height      int `json:"height"`
+	FPS         int `json:"fps"`
+}
+
+type audioQualityBootstrap struct {
+	SampleRateHz  int                       `json:"sample_rate_hz"`
+	Channels      int                       `json:"channels"`
+	StereoEnabled bool                      `json:"stereo_enabled"`
+	DTXEnabled    bool                      `json:"dtx_enabled"`
+	FECEnabled    bool                      `json:"fec_enabled"`
+	Profiles      map[string]profileBitrate `json:"profiles"`
+}
+
+type videoQualityBootstrap struct {
+	Profiles map[string]videoProfile `json:"profiles"`
+}
+
+type mediaQualityBootstrap struct {
+	DefaultProfile string                `json:"default_profile"`
+	Audio          audioQualityBootstrap `json:"audio"`
+	Video          videoQualityBootstrap `json:"video"`
+}
+
 type sfuBootstrapConfig struct {
-	InternalAPIBase        string               `json:"internal_api_base"`
-	InternalSecret         string               `json:"internal_secret"`
-	MaxTotalPeers          int                  `json:"max_total_peers"`
-	MaxRoomPeers           int                  `json:"max_room_peers"`
-	RoomEndGraceSeconds    int                  `json:"room_end_grace_seconds"`
-	InternalEventWorkers   int                  `json:"internal_event_workers"`
-	InternalEventQueueSize int                  `json:"internal_event_queue_size"`
-	InternalHTTPTimeoutSec int                  `json:"internal_http_timeout_seconds"`
-	WSWriteTimeoutSec      int                  `json:"ws_write_timeout_seconds"`
-	WSPingIntervalSec      int                  `json:"ws_ping_interval_seconds"`
-	WSPongWaitSec          int                  `json:"ws_pong_wait_seconds"`
-	WSReadLimitBytes       int                  `json:"ws_read_limit_bytes"`
-	UDPPortMin             int                  `json:"udp_port_min"`
-	UDPPortMax             int                  `json:"udp_port_max"`
-	IceServers             []bootstrapIceServer `json:"ice_servers"`
+	InternalAPIBase        string                `json:"internal_api_base"`
+	InternalSecret         string                `json:"internal_secret"`
+	MaxTotalPeers          int                   `json:"max_total_peers"`
+	MaxRoomPeers           int                   `json:"max_room_peers"`
+	RoomEndGraceSeconds    int                   `json:"room_end_grace_seconds"`
+	InternalEventWorkers   int                   `json:"internal_event_workers"`
+	InternalEventQueueSize int                   `json:"internal_event_queue_size"`
+	InternalHTTPTimeoutSec int                   `json:"internal_http_timeout_seconds"`
+	WSWriteTimeoutSec      int                   `json:"ws_write_timeout_seconds"`
+	WSPingIntervalSec      int                   `json:"ws_ping_interval_seconds"`
+	WSPongWaitSec          int                   `json:"ws_pong_wait_seconds"`
+	WSReadLimitBytes       int                   `json:"ws_read_limit_bytes"`
+	UDPPortMin             int                   `json:"udp_port_min"`
+	UDPPortMax             int                   `json:"udp_port_max"`
+	IceServers             []bootstrapIceServer  `json:"ice_servers"`
+	MediaQuality           mediaQualityBootstrap `json:"media_quality"`
 }
 
 type bootstrapConfigResponse struct {
@@ -313,6 +346,30 @@ func loadConfigFromTOML(filePath string) (*MediaSFUConfig, error) {
 	return &cfg.MediaSFU, nil
 }
 
+func defaultSharedConfigPath() string {
+	candidates := []string{
+		"/root/.pufferblow/config.toml",
+	}
+
+	if homeDir, err := os.UserHomeDir(); err == nil && strings.TrimSpace(homeDir) != "" {
+		candidates = append(
+			[]string{filepath.Join(homeDir, ".pufferblow", "config.toml")},
+			candidates...,
+		)
+	}
+
+	for _, candidate := range candidates {
+		if candidate == "" {
+			continue
+		}
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+
+	return candidates[0]
+}
+
 // ─────────────────────────────────────────────
 // Server
 // ─────────────────────────────────────────────
@@ -335,9 +392,10 @@ type sfuServer struct {
 	eventWorkers int
 	eventQueue   chan internalEvent
 
-	httpClient *http.Client
-	webrtcAPI  *webrtc.API
-	iceServers []webrtc.ICEServer
+	httpClient   *http.Client
+	webrtcAPI    *webrtc.API
+	iceServers   []webrtc.ICEServer
+	mediaQuality mediaQualityBootstrap
 
 	roomsMu sync.RWMutex
 	rooms   map[string]*room
@@ -368,7 +426,7 @@ func newServer(configPath string) (*sfuServer, error) {
 	}
 
 	// ── helpers ──────────────────────────────────────
-	// All configuration is read exclusively from config.toml.
+	// All configuration is read exclusively from the shared Pufferblow config.toml.
 	// If a value is absent or zero, the hardcoded default is used.
 	// Environment variables are intentionally not consulted.
 	str := func(tomlVal, fallback string) string {
@@ -411,7 +469,7 @@ func newServer(configPath string) (*sfuServer, error) {
 	default:
 		slogLevel = slog.LevelInfo
 	}
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slogLevel,
 		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
 			// Rename "time" → "ts" to match Pufferblow backend log format
@@ -423,16 +481,16 @@ func newServer(configPath string) (*sfuServer, error) {
 	}))
 
 	// ── core config ───────────────────────────────────
-	bindAddr      := str(tomlConfig.BindAddr, ":8787")
+	bindAddr := str(tomlConfig.BindAddr, ":8787")
 	maxTotalPeers := integer(tomlConfig.MaxTotalPeers, 1000)
-	maxRoomPeers  := integer(tomlConfig.MaxRoomPeers, 100)
-	roomEndGrace  := integer(tomlConfig.RoomEndGraceSeconds, 15)
-	eventWorkers  := integer(tomlConfig.EventWorkers, runtime.NumCPU()*2)
-	eventQSize    := integer(tomlConfig.EventQueueSize, 8192)
+	maxRoomPeers := integer(tomlConfig.MaxRoomPeers, 100)
+	roomEndGrace := integer(tomlConfig.RoomEndGraceSeconds, 15)
+	eventWorkers := integer(tomlConfig.EventWorkers, runtime.NumCPU()*2)
+	eventQSize := integer(tomlConfig.EventQueueSize, 8192)
 
 	writeTimeout := dur(durFromSec(tomlConfig.WSWriteTimeoutSeconds), 4*time.Second)
 	pingInterval := dur(durFromSec(tomlConfig.WSPingIntervalSeconds), 20*time.Second)
-	pongWait     := dur(durFromSec(tomlConfig.WSPongWaitSeconds), 45*time.Second)
+	pongWait := dur(durFromSec(tomlConfig.WSPongWaitSeconds), 45*time.Second)
 	if pingInterval >= pongWait {
 		pingInterval = pongWait / 2
 	}
@@ -560,6 +618,7 @@ func newServer(configPath string) (*sfuServer, error) {
 	}
 
 	server.iceServers = parseBootstrapIceServers(bootstrapCfg.IceServers)
+	server.mediaQuality = bootstrapCfg.MediaQuality
 	server.webrtcAPI = webrtc.NewAPI(webrtc.WithSettingEngine(se))
 
 	logger.Info("pufferblow media-sfu initialised",
@@ -575,6 +634,9 @@ func newServer(configPath string) (*sfuServer, error) {
 		"write_timeout", server.writeTimeout,
 		"read_limit_bytes", server.readLimit,
 		"ice_servers", len(server.iceServers),
+		"default_quality_profile", server.mediaQuality.DefaultProfile,
+		"audio_bitrate_balanced_kbps", server.mediaQuality.Audio.Profiles["balanced"].BitrateKbps,
+		"video_bitrate_balanced_kbps", server.mediaQuality.Video.Profiles["balanced"].BitrateKbps,
 		"log_level", logLevel,
 		"metrics_auth", metricsSecret != "",
 	)
@@ -718,6 +780,7 @@ func (s *sfuServer) metrics(w http.ResponseWriter, r *http.Request) {
 		"internal_event_workers":   s.eventWorkers,
 		"internal_event_queue_len": len(s.eventQueue),
 		"internal_event_queue_cap": cap(s.eventQueue),
+		"media_quality":            s.mediaQuality,
 		"rooms":                    roomMetrics,
 	})
 }
@@ -1720,7 +1783,11 @@ func parseBootstrapIceServers(entries []bootstrapIceServer) []webrtc.ICEServer {
 // ─────────────────────────────────────────────
 
 func main() {
-	configPath := flag.String("config", "", "Path to config.toml file")
+	configPath := flag.String(
+		"config",
+		defaultSharedConfigPath(),
+		"Path to the shared Pufferblow config.toml file",
+	)
 	flag.Parse()
 
 	server, err := newServer(*configPath)
