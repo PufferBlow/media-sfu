@@ -1,186 +1,191 @@
-# Pufferblow Media SFU
+<div align="center">
 
-`media-sfu` is the dedicated real-time media plane for Pufferblow.
+<img src="https://raw.githubusercontent.com/PufferBlow/client/main/public/pufferblow-logo.svg" width="120" alt="Pufferblow logo" />
 
-- Repository target: `https://github.com/pufferblow/media-sfu`
-- Runtime: Go + Pion WebRTC
-- Scope: SFU forwarding (voice-first), signaling, and control-plane callbacks to Pufferblow API
-- Logs: human-readable text output on stdout via Go `slog`
+# Pufferblow media-sfu
 
-## Architecture
+**The WebRTC media plane for Pufferblow voice channels.**
 
-- Control plane: `pufferblow` (Python/FastAPI) issues join tokens, enforces auth/permissions, stores session state.
-- Media plane: `media-sfu` handles WebRTC peer sessions, RTP forwarding, and participant lifecycle.
-- Relay plane: `coturn` handles NAT traversal/fallback.
-- Configuration: `media-sfu` reads the shared Pufferblow config file at `~/.pufferblow/config.toml`, using the `[media-sfu]` section.
+[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square)](LICENSE)
+[![Go](https://img.shields.io/badge/Go-1.24%2B-00ADD8?style=flat-square&logo=go&logoColor=white)](https://go.dev/)
+[![Pion WebRTC](https://img.shields.io/badge/Pion-WebRTC-v4-blue?style=flat-square)](https://github.com/pion/webrtc)
+[![CI](https://img.shields.io/github/actions/workflow/status/PufferBlow/media-sfu/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/PufferBlow/media-sfu/actions)
+[![GitHub Stars](https://img.shields.io/github/stars/PufferBlow/media-sfu?style=flat-square&color=yellow)](https://github.com/PufferBlow/media-sfu/stargazers)
 
-## Protocol
+</div>
 
-- WebSocket signaling endpoint:
-  - `GET /rtc/v1/ws?join_token=<token>`
-- Health and ops:
-  - `GET /healthz`
-  - `GET /readyz`
-  - `GET /metrics` (JSON metrics snapshot)
+---
 
-Pufferblow also mirrors SFU health through the instance control plane at:
+## Overview
 
-- `GET /api/v1/system/instance-health`
-- `GET /healthz`
-- `GET /readyz`
+`media-sfu` is the dedicated real-time media plane for Pufferblow. It handles WebRTC peer sessions, RTP audio forwarding, and participant lifecycle events for voice channels.
 
-That lets operators inspect Python control-plane health and nested SFU health
-from the instance itself, even when `media-sfu` is deployed separately.
+It is designed to run alongside the main Pufferblow API, which acts as the control plane — issuing join tokens, enforcing authentication, and storing session state. `media-sfu` does none of that; it only forwards media and calls back to the API for authoritative decisions.
 
-### Signaling message types
+### Design goals
 
-Client -> SFU:
-- `join`
-- `offer`
-- `answer`
-- `candidate`
-- `audio_state`
-- `ping`
+- Voice-first SFU (Selective Forwarding Unit) — low latency, no media transcoding
+- Scales to **100+ concurrent audio participants** across rooms on a single instance
+- Tunable via shared `~/.pufferblow/config.toml` — no separate config file to manage
+- Stateless between restarts (session state lives in the Pufferblow API's database)
 
-SFU -> Client:
-- `joined`
-- `participant_joined`
-- `participant_left`
-- `offer`
-- `answer`
-- `candidate`
-- `speaker_levels`
-- `pong`
-- `error`
+---
 
-## Internal API callbacks (to Pufferblow server)
+## How It Fits Together
 
-Configured from server-provided bootstrap config at startup.
+```
+Client (browser / desktop app)
+        │  WebSocket + WebRTC
+        ▼
+  ┌─────────────┐    bootstrap / callbacks    ┌─────────────────────┐
+  │  media-sfu  │ ◄──────────────────────────► │  Pufferblow API     │
+  │  (Go / Pion │                              │  (Python / FastAPI) │
+  │   port 8787)│                              │  (port 7575)        │
+  └─────────────┘                              └─────────────────────┘
+        │  STUN / TURN (NAT traversal)
+        ▼
+     coturn
+```
 
-- `POST /consume-join-token`
-- `POST /events`
+On startup, `media-sfu` fetches its runtime configuration from the Pufferblow API (`/api/internal/v1/voice/bootstrap-config`). After that, all communication is through internal callback endpoints signed with HMAC-SHA256.
 
-Requests are signed with `X-Pufferblow-Signature: sha256=<hex>` using `RTC_INTERNAL_SECRET`.
+---
 
-## Scalability Baseline
+## Requirements
 
-This service is tuned for a practical first target of **100+ concurrent audio clients** (across channels/rooms) with:
+- Go 1.24 or later
+- A running [Pufferblow](https://github.com/PufferBlow/pufferblow) instance
+- `~/.pufferblow/config.toml` with a `[media-sfu]` section (created by `pufferblow setup`)
+- Optional: a TURN server (coturn) for clients behind strict NAT
 
-- connection admission control:
-  - `RTC_MAX_TOTAL_PEERS`
-  - `RTC_MAX_ROOM_PEERS`
-- bounded internal event queue + workers:
-  - `RTC_INTERNAL_EVENT_WORKERS`
-  - `RTC_INTERNAL_EVENT_QUEUE_SIZE`
-- websocket keepalive and safety:
-  - read limit, ping/pong timers, write timeout
-- reconnect grace window for empty rooms:
-  - `RTC_ROOM_END_GRACE` (default `15s`)
-- fixed UDP port range for predictable infra/networking:
-  - `RTC_UDP_PORT_MIN`
-  - `RTC_UDP_PORT_MAX`
-- metrics endpoint for capacity monitoring.
+---
 
-## Shared Config
-
-`media-sfu` does not keep a repo-local config file. It reads the global Pufferblow config at:
-
-- Linux/macOS: `~/.pufferblow/config.toml`
-- Docker compose in this repo: `/root/.pufferblow/config.toml`
-
-The media-plane settings live under the `[media-sfu]` section in that shared file. All operational settings (bootstrap URL/secret, bind address, queue/timeouts, peer limits, UDP range) are sourced from there.
-
-## Local Run
+## Running Locally
 
 ```bash
 go mod download
 go run ./cmd/server -config ~/.pufferblow/config.toml
 ```
 
-## Testing
+The server binds to `:8787` by default (configurable via `bind_addr` in `config.toml`).
 
-The repo includes:
-
-- unit tests for config, signing, and bootstrap helpers
-- a signaling benchmark: `BenchmarkMediaSFUSignalingJoin`
-- a concurrent join stress test: `TestMediaSFUSignalingStress`
-- a churn-oriented soak test: `TestMediaSFUSignalingSoak`
-
-Use the bundled runner:
-
-```bash
-./scripts/run_test.sh
-```
-
-Default behavior:
-
-- runs `go test ./...`
-- runs the signaling benchmark
-- skips stress and soak tests unless explicitly enabled
-
-Runner modes:
-
-```bash
-./scripts/run_test.sh --stress
-./scripts/run_test.sh --soak
-./scripts/run_test.sh --heavy
-```
-
-- `--stress`: runs the concurrent join test with the configured client count
-- `--soak`: runs the longer churn test at fixed concurrency for a bounded duration
-- `--heavy`: enables both stress and soak with larger benchmark-oriented defaults
-
-Useful environment overrides:
-
-```bash
-BENCH_TIME=10x ./scripts/run_test.sh
-STRESS_CLIENTS=256 ./scripts/run_test.sh --stress
-SOAK_CLIENTS=64 SOAK_DURATION_SECONDS=120 SOAK_HOLD_MILLISECONDS=250 ./scripts/run_test.sh --soak
-```
-
-Supported runner environment variables:
-
-- `UNIT_TEST_PATTERN`
-- `BENCH_PATTERN`
-- `BENCH_TIME`
-- `RUN_STRESS`
-- `STRESS_CLIENTS`
-- `STRESS_TEST_PATTERN`
-- `RUN_SOAK`
-- `SOAK_CLIENTS`
-- `SOAK_DURATION_SECONDS`
-- `SOAK_HOLD_MILLISECONDS`
-- `SOAK_TEST_PATTERN`
-
-Important scope note:
-
-- the benchmark, stress, and soak tests exercise the SFU control plane and websocket signaling path
-- they do not simulate sustained RTP media forwarding bandwidth across real peer media streams
+---
 
 ## Docker
 
 ```bash
 docker build -t pufferblow-media-sfu .
+
 docker run --rm -p 8787:8787 \
   -v "$HOME/.pufferblow:/root/.pufferblow:ro" \
   pufferblow-media-sfu
 ```
 
-## Server Integration (Compose)
+---
 
-The server compose file is configured to build SFU from this dedicated repo using:
+## Configuration
 
-`MEDIA_SFU_GIT_CONTEXT=https://github.com/pufferblow/media-sfu.git`
+`media-sfu` reads the `[media-sfu]` section from the shared Pufferblow config file. Example:
 
-This keeps `pufferblow` (server) and `media-sfu` (media plane) independently versioned and deployable.
-
-## Split and Publish as Separate Repo
-
-If you are splitting from this monorepo, use:
-
-```bash
-git -C pufferblow subtree split --prefix=media-sfu -b media-sfu-split
-git -C pufferblow push https://github.com/pufferblow/media-sfu.git media-sfu-split:main
+```toml
+[media-sfu]
+bootstrap_config_url     = "http://localhost:7575/api/internal/v1/voice/bootstrap-config"
+bootstrap_secret         = "change-this-secret"
+bind_addr                = ":8787"
+max_total_peers          = 1000
+max_room_peers           = 100
+room_end_grace_seconds   = 15
+event_workers            = 4
+event_queue_size         = 8192
+http_timeout_seconds     = 5
+ws_write_timeout_seconds = 4
+ws_ping_interval_seconds = 20
+ws_pong_wait_seconds     = 45
+ws_read_limit_bytes      = 1048576
+udp_port_min             = 50000
+udp_port_max             = 51999
 ```
 
-Then future updates can be pushed from the dedicated repo directly.
+Run `pufferblow setup --setup-media-sfu` to generate and write this section interactively.
+
+---
+
+## API Endpoints
+
+### Public (WebSocket signaling)
+
+| Endpoint | Description |
+|---|---|
+| `GET /rtc/v1/ws?join_token=<token>` | Client WebSocket connection |
+
+### Operational
+
+| Endpoint | Description |
+|---|---|
+| `GET /healthz` | Liveness check |
+| `GET /readyz` | Readiness check |
+| `GET /metrics` | JSON metrics snapshot |
+
+### Internal callbacks (called by Pufferblow API)
+
+These are not client-facing. All requests must carry a valid `X-Pufferblow-Signature` HMAC-SHA256 header.
+
+| Endpoint | Description |
+|---|---|
+| `POST /api/internal/v1/voice/bootstrap-config` | Fetch runtime config at startup |
+| `POST /api/internal/v1/voice/consume-join-token` | Validate and consume a one-time join token |
+| `POST /api/internal/v1/voice/events` | Deliver participant lifecycle events |
+
+---
+
+## WebSocket Message Types
+
+**Client → SFU**
+
+`join` · `offer` · `answer` · `candidate` · `audio_state` · `ping`
+
+**SFU → Client**
+
+`joined` · `participant_joined` · `participant_left` · `offer` · `answer` · `candidate` · `speaker_levels` · `pong` · `error`
+
+---
+
+## Logging
+
+Logs are written to stdout via Go `slog`. When stdout is a terminal, output is rendered in colour using [tint](https://github.com/lmittmann/tint). When piped to a file or log aggregator, plain structured text is used instead.
+
+Log level is set via `log_level` in `config.toml` (`debug`, `info`, `warn`, `error`). Default is `info`.
+
+---
+
+## Testing
+
+```bash
+# Run unit tests
+./scripts/run_test.sh
+
+# Include concurrent join stress test
+./scripts/run_test.sh --stress
+
+# Include long-running soak test
+./scripts/run_test.sh --soak
+
+# Both stress and soak with higher defaults
+./scripts/run_test.sh --heavy
+```
+
+Useful environment overrides:
+
+```bash
+STRESS_CLIENTS=256 ./scripts/run_test.sh --stress
+SOAK_CLIENTS=64 SOAK_DURATION_SECONDS=120 ./scripts/run_test.sh --soak
+BENCH_TIME=10x ./scripts/run_test.sh
+```
+
+> The stress and soak tests exercise the signaling path and control plane. They do not simulate sustained RTP media bandwidth across real peer streams.
+
+---
+
+## License
+
+Released under the [GNU General Public License v3.0](LICENSE).
