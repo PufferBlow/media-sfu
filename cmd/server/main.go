@@ -27,6 +27,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/gorilla/websocket"
+	"github.com/lmittmann/tint"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -469,16 +470,30 @@ func newServer(configPath string) (*sfuServer, error) {
 	default:
 		slogLevel = slog.LevelInfo
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slogLevel,
-		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
-			// Rename "time" → "ts" to match Pufferblow backend log format
-			if a.Key == slog.TimeKey {
-				a.Key = "ts"
-			}
-			return a
-		},
-	}))
+	replaceAttr := func(_ []string, a slog.Attr) slog.Attr {
+		if a.Key == slog.TimeKey {
+			a.Key = "ts"
+		}
+		return a
+	}
+	isTTY := func(f *os.File) bool {
+		fi, err := f.Stat()
+		return err == nil && (fi.Mode()&os.ModeCharDevice) != 0
+	}
+	var handler slog.Handler
+	if isTTY(os.Stdout) {
+		handler = tint.NewHandler(os.Stdout, &tint.Options{
+			Level:       slogLevel,
+			TimeFormat:  time.DateTime,
+			ReplaceAttr: replaceAttr,
+		})
+	} else {
+		handler = slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+			Level:       slogLevel,
+			ReplaceAttr: replaceAttr,
+		})
+	}
+	logger := slog.New(handler)
 
 	// ── core config ───────────────────────────────────
 	bindAddr := str(tomlConfig.BindAddr, ":8787")
