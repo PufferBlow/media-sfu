@@ -108,6 +108,62 @@ udp_port_max             = 51999
 
 Run `pufferblow setup --setup-media-sfu` to generate and write this section interactively.
 
+### ICE servers (STUN / TURN)
+
+`media-sfu` doesn't ship its own STUN/TURN — it consumes the list the
+Pufferblow API hands back in the bootstrap response (`ice_servers`). Each
+entry can be either a single URL string or an array of URLs, with optional
+`username` / `credential` for TURN.
+
+Public STUN is enough for most home/office NATs. Carrier-grade NAT, mobile,
+and corporate networks usually need a real TURN relay. The shortest
+self-host path is [coturn](https://github.com/coturn/coturn):
+
+```bash
+docker run -d --name pufferblow-coturn --network host \
+  -e DETECT_EXTERNAL_IP=yes -e DETECT_RELAY_IP=yes \
+  coturn/coturn -n \
+    --listening-port=3478 \
+    --tls-listening-port=5349 \
+    --realm=pufferblow.example.com \
+    --use-auth-secret \
+    --static-auth-secret=change-me \
+    --no-multicast-peers \
+    --no-cli
+```
+
+Then expose it to the SFU via the Pufferblow API's bootstrap config:
+
+```json
+{
+  "ice_servers": [
+    {"urls": "stun:stun.l.google.com:19302"},
+    {
+      "urls": ["turn:turn.example.com:3478", "turns:turn.example.com:5349"],
+      "username": "pufferblow",
+      "credential": "<short-lived-secret-or-shared>"
+    }
+  ]
+}
+```
+
+At startup the SFU logs one `ICE server configured` line per entry. TURN
+credentials are masked (`credential=***`) so logs are safe to share. If
+no ICE servers are configured at all you'll see:
+
+```
+WARN  No ICE servers configured — peers behind strict NAT will fail to connect
+```
+
+That warning is a deployment smell; either you forgot to configure TURN or
+your bootstrap endpoint isn't returning it.
+
+> **Verification.** From a host behind your target NAT, run `chrome://webrtc-internals`
+> (or `about:webrtc` on Firefox) during a voice connect. The remote-candidate
+> stats should list at least one `relay` candidate when TURN is in use; if you
+> only ever see `srflx` you're on STUN-only and clients behind symmetric NAT
+> will be unable to join.
+
 ---
 
 ## API Endpoints

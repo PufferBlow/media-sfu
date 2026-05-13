@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/pion/webrtc/v4"
 )
 
 func TestJoinClaimsHasScope(t *testing.T) {
@@ -311,5 +313,58 @@ func TestParseBootstrapIceServers(t *testing.T) {
 	}
 	if got[1].Username != "alice" || got[1].Credential != "secret" {
 		t.Fatalf("unexpected ICE auth payload: %+v", got[1])
+	}
+}
+
+func TestSummarizeICEServersForLogMasksCredentials(t *testing.T) {
+	servers := []webrtc.ICEServer{
+		{URLs: []string{"stun:stun.l.google.com:19302"}},
+		{
+			URLs:       []string{"turn:turn.example.com:3478", "turns:turn.example.com:5349"},
+			Username:   "alice",
+			Credential: "super-secret-password",
+		},
+		{
+			URLs:     []string{"turn:nocred.example.com:3478"},
+			Username: "bob",
+			// Credential intentionally absent — half-configured TURN.
+		},
+		{
+			URLs:       []string{"turn:no-user.example.com:3478"},
+			Credential: "leaked?",
+		},
+	}
+
+	summary := summarizeICEServersForLog(servers)
+	if len(summary) != 4 {
+		t.Fatalf("expected 4 summary lines, got %d (%v)", len(summary), summary)
+	}
+
+	for i, line := range summary {
+		if strings.Contains(line, "super-secret-password") || strings.Contains(line, "leaked?") {
+			t.Fatalf("summary[%d] leaked credential: %q", i, line)
+		}
+	}
+
+	if !strings.Contains(summary[0], "stun:stun.l.google.com:19302") {
+		t.Fatalf("STUN-only entry not rendered: %q", summary[0])
+	}
+	if !strings.Contains(summary[1], "user=alice") || !strings.Contains(summary[1], "credential=***") {
+		t.Fatalf("TURN-with-cred entry rendered wrong: %q", summary[1])
+	}
+	if !strings.Contains(summary[2], "user=bob") || !strings.Contains(summary[2], "credential=<missing>") {
+		t.Fatalf("TURN-without-cred entry rendered wrong: %q", summary[2])
+	}
+	if !strings.Contains(summary[3], "credential=***") || !strings.Contains(summary[3], "no-user") {
+		t.Fatalf("TURN-without-user entry rendered wrong: %q", summary[3])
+	}
+}
+
+func TestSummarizeICEServersForLogHandlesEmpty(t *testing.T) {
+	if got := summarizeICEServersForLog(nil); len(got) != 0 {
+		t.Fatalf("expected nil servers to render empty, got %v", got)
+	}
+	if got := summarizeICEServersForLog([]webrtc.ICEServer{}); len(got) != 0 {
+		t.Fatalf("expected empty slice to render empty, got %v", got)
 	}
 }
