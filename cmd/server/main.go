@@ -28,6 +28,7 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/gorilla/websocket"
 	"github.com/lmittmann/tint"
+	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -260,13 +261,23 @@ func (p *peer) setState(muted, deafened, speaking bool) (changed bool) {
 // Room
 // ─────────────────────────────────────────────
 
+// roomTrack ties a fanned-out local RTP track to its source peer + SSRC so
+// the receiver-side RTCP drain can forward PLI / FIR back to the publisher.
+// Receivers asking for a keyframe is how video recovers after packet loss;
+// without this association we'd silently swallow those requests.
+type roomTrack struct {
+	Local      *webrtc.TrackLocalStaticRTP
+	Publisher  *peer
+	RemoteSSRC uint32
+}
+
 type room struct {
 	SessionID string
 	ChannelID string
 
 	Mu     sync.RWMutex
 	Peers  map[string]*peer
-	Tracks map[string]*webrtc.TrackLocalStaticRTP
+	Tracks map[string]*roomTrack
 }
 
 func (r *room) snapshots() []participantSnapshot {
@@ -825,7 +836,7 @@ func (s *sfuServer) getOrCreateRoom(sessionID, channelID string) (*room, bool) {
 		SessionID: sessionID,
 		ChannelID: channelID,
 		Peers:     map[string]*peer{},
-		Tracks:    map[string]*webrtc.TrackLocalStaticRTP{},
+		Tracks:    map[string]*roomTrack{},
 	}
 	s.rooms[sessionID] = r
 	s.totalRooms.Add(1)
@@ -1050,20 +1061,16 @@ func (s *sfuServer) consumeJoinToken(joinToken string) (*joinClaims, error) {
 // Track fanout
 // ─────────────────────────────────────────────
 
-func (s *sfuServer) addTrackToPeer(target *peer, track *webrtc.TrackLocalStaticRTP) error {
-	sender, err := target.PC.AddTrack(track)
+func (s *sfuServer) addTrackToPeer(target *peer, rt *roomTrack) error {
+	sender, err := target.PC.AddTrack(rt.Local)
 	if err != nil {
 		return err
 	}
-	// Drain RTCP — required or the sender will stall.
-	go func() {
-		buf := make([]byte, 1500)
-		for {
-			if _, _, readErr := sender.Read(buf); readErr != nil {
-				return
-			}
-		}
-	}()
+	// Drain RTCP from the receiver and forward picture-loss feedback back to
+	// the publisher so video can recover after packet loss. Without this the
+	// sender would stall (drain is required by pion) AND receivers asking for
+	// a keyframe would be silently swallowed.
+	go s.forwardReceiverRTCP(sender, rt)
 
 	offer, err := target.PC.CreateOffer(nil)
 	if err != nil {
@@ -1077,6 +1084,77 @@ func (s *sfuServer) addTrackToPeer(target *peer, track *webrtc.TrackLocalStaticR
 		SessionID: target.SessionID,
 		Offer:     &offer,
 	})
+}
+
+// rewriteKeyframeRequests filters a batch of receiver-side RTCP packets and
+// returns the PLI / FIR packets rewritten with the publisher's SSRC. The
+// helper is extracted from forwardReceiverRTCP so it can be tested without a
+// real RTPSender or RTPCConn.
+func rewriteKeyframeRequests(packets []rtcp.Packet, publisherSSRC uint32) []rtcp.Packet {
+	if publisherSSRC == 0 || len(packets) == 0 {
+		return nil
+	}
+	var out []rtcp.Packet
+	for _, pkt := range packets {
+		switch p := pkt.(type) {
+		case *rtcp.PictureLossIndication:
+			out = append(out, &rtcp.PictureLossIndication{
+				MediaSSRC: publisherSSRC,
+			})
+			_ = p // silence linter — we deliberately don't copy other fields
+		case *rtcp.FullIntraRequest:
+			// Preserve FIR's SequenceNumber/Entries shape but rewrite the
+			// target SSRC. A copy avoids racing with the receiver's
+			// goroutine if it still holds the original.
+			rewritten := *p
+			rewritten.MediaSSRC = publisherSSRC
+			out = append(out, &rewritten)
+		}
+	}
+	return out
+}
+
+// forwardReceiverRTCP pumps RTCP from a receiver's RTPSender. Picture-loss
+// indications (PLI) and full-intra requests (FIR) are rewritten with the
+// publisher's SSRC and re-emitted on the publisher's peer connection so the
+// upstream encoder is asked to generate a fresh keyframe. All other RTCP
+// types are drained without forwarding — the SFU itself doesn't process
+// them in v1.0, but reading them is mandatory or the sender stalls.
+//
+// Returns when ReadRTCP errors (typically because the receiver has gone
+// away or the connection is closed). Publisher write failures are logged
+// at debug because the publisher may have disconnected too, in which case
+// the receiver fanout is about to tear down anyway.
+func (s *sfuServer) forwardReceiverRTCP(sender *webrtc.RTPSender, rt *roomTrack) {
+	if sender == nil || rt == nil {
+		return
+	}
+	for {
+		packets, _, readErr := sender.ReadRTCP()
+		if readErr != nil {
+			return
+		}
+		if rt.Publisher == nil || rt.Publisher.PC == nil || rt.RemoteSSRC == 0 {
+			continue
+		}
+		toForward := rewriteKeyframeRequests(packets, rt.RemoteSSRC)
+		if len(toForward) == 0 {
+			continue
+		}
+		if err := rt.Publisher.PC.WriteRTCP(toForward); err != nil {
+			s.log.Debug("publisher RTCP write failed",
+				"publisher_user_id", rt.Publisher.UserID,
+				"remote_ssrc", rt.RemoteSSRC,
+				"err", err,
+			)
+			return
+		}
+		s.log.Debug("forwarded receiver keyframe request to publisher",
+			"publisher_user_id", rt.Publisher.UserID,
+			"remote_ssrc", rt.RemoteSSRC,
+			"count", len(toForward),
+		)
+	}
 }
 
 // handleRemoteTrack proxies RTP from a source peer to all other peers in the room.
@@ -1103,9 +1181,15 @@ func (s *sfuServer) handleRemoteTrack(r *room, srcPeer *peer, remoteTrack *webrt
 		return
 	}
 
+	rt := &roomTrack{
+		Local:      localTrack,
+		Publisher:  srcPeer,
+		RemoteSSRC: uint32(remoteTrack.SSRC()),
+	}
+
 	// Collect current peers and register the track — all under one lock acquisition.
 	r.Mu.Lock()
-	r.Tracks[trackKey] = localTrack
+	r.Tracks[trackKey] = rt
 	targets := make([]*peer, 0, len(r.Peers))
 	for _, p := range r.Peers {
 		if p.UserID != srcPeer.UserID {
@@ -1120,7 +1204,7 @@ func (s *sfuServer) handleRemoteTrack(r *room, srcPeer *peer, remoteTrack *webrt
 		wg.Add(1)
 		go func(t *peer) {
 			defer wg.Done()
-			if fanErr := s.addTrackToPeer(t, localTrack); fanErr != nil {
+			if fanErr := s.addTrackToPeer(t, rt); fanErr != nil {
 				s.log.Warn("track fanout failed",
 					"track_key", trackKey,
 					"target_user_id", t.UserID,
@@ -1426,7 +1510,7 @@ func (s *sfuServer) handleWS(w http.ResponseWriter, r *http.Request) {
 	})
 
 	// ── Register peer in room ────────────────────────
-	var existingTracks []*webrtc.TrackLocalStaticRTP
+	var existingTracks []*roomTrack
 	roomObj.Mu.Lock()
 	// Re-check capacity under the room lock (authoritative check).
 	if s.maxRoomPeers > 0 && len(roomObj.Peers) >= s.maxRoomPeers {
@@ -1445,7 +1529,7 @@ func (s *sfuServer) handleWS(w http.ResponseWriter, r *http.Request) {
 		_ = conn.WriteJSON(signalMessage{Type: "error", Error: "already connected in this session"})
 		return
 	}
-	existingTracks = make([]*webrtc.TrackLocalStaticRTP, 0, len(roomObj.Tracks))
+	existingTracks = make([]*roomTrack, 0, len(roomObj.Tracks))
 	for _, t := range roomObj.Tracks {
 		existingTracks = append(existingTracks, t)
 	}
@@ -1470,7 +1554,7 @@ func (s *sfuServer) handleWS(w http.ResponseWriter, r *http.Request) {
 		var wg sync.WaitGroup
 		for _, t := range existingTracks {
 			wg.Add(1)
-			go func(track *webrtc.TrackLocalStaticRTP) {
+			go func(track *roomTrack) {
 				defer wg.Done()
 				if err := s.addTrackToPeer(peerObj, track); err != nil {
 					s.log.Warn("failed to add existing track to new peer",

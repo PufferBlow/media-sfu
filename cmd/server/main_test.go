@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -366,5 +367,87 @@ func TestSummarizeICEServersForLogHandlesEmpty(t *testing.T) {
 	}
 	if got := summarizeICEServersForLog([]webrtc.ICEServer{}); len(got) != 0 {
 		t.Fatalf("expected empty slice to render empty, got %v", got)
+	}
+}
+
+func TestRewriteKeyframeRequestsRewritesPLI(t *testing.T) {
+	const publisherSSRC = uint32(0xDEADBEEF)
+	receiverInput := []rtcp.Packet{
+		&rtcp.PictureLossIndication{
+			SenderSSRC: 0x11111111,
+			MediaSSRC:  0x22222222, // receiver-side SSRC, must be rewritten
+		},
+	}
+
+	out := rewriteKeyframeRequests(receiverInput, publisherSSRC)
+	if len(out) != 1 {
+		t.Fatalf("expected 1 forwarded packet, got %d", len(out))
+	}
+	pli, ok := out[0].(*rtcp.PictureLossIndication)
+	if !ok {
+		t.Fatalf("expected *rtcp.PictureLossIndication, got %T", out[0])
+	}
+	if pli.MediaSSRC != publisherSSRC {
+		t.Fatalf("MediaSSRC not rewritten: got %#x, want %#x", pli.MediaSSRC, publisherSSRC)
+	}
+}
+
+func TestRewriteKeyframeRequestsRewritesFIR(t *testing.T) {
+	const publisherSSRC = uint32(0xC0FFEE00)
+	original := &rtcp.FullIntraRequest{
+		SenderSSRC: 0x11111111,
+		MediaSSRC:  0x22222222,
+		FIR: []rtcp.FIREntry{
+			{SSRC: 0x33333333, SequenceNumber: 7},
+		},
+	}
+
+	out := rewriteKeyframeRequests([]rtcp.Packet{original}, publisherSSRC)
+	if len(out) != 1 {
+		t.Fatalf("expected 1 forwarded packet, got %d", len(out))
+	}
+	fir, ok := out[0].(*rtcp.FullIntraRequest)
+	if !ok {
+		t.Fatalf("expected *rtcp.FullIntraRequest, got %T", out[0])
+	}
+	if fir.MediaSSRC != publisherSSRC {
+		t.Fatalf("MediaSSRC not rewritten: got %#x, want %#x", fir.MediaSSRC, publisherSSRC)
+	}
+	if len(fir.FIR) != 1 || fir.FIR[0].SequenceNumber != 7 {
+		t.Fatalf("FIR payload mutated unexpectedly: %+v", fir)
+	}
+	// Original must remain untouched — receiver's goroutine may still hold it.
+	if original.MediaSSRC != 0x22222222 {
+		t.Fatalf("original FIR mutated: %#x", original.MediaSSRC)
+	}
+}
+
+func TestRewriteKeyframeRequestsDropsUnrelatedRTCP(t *testing.T) {
+	const publisherSSRC = uint32(0xABCDEF01)
+	packets := []rtcp.Packet{
+		&rtcp.ReceiverReport{}, // not a keyframe request — must be ignored
+		&rtcp.SenderReport{},
+		&rtcp.SourceDescription{},
+		&rtcp.PictureLossIndication{MediaSSRC: 0xFFFFFFFF},
+	}
+
+	out := rewriteKeyframeRequests(packets, publisherSSRC)
+	if len(out) != 1 {
+		t.Fatalf("expected only the PLI to be forwarded, got %d packets", len(out))
+	}
+	if _, ok := out[0].(*rtcp.PictureLossIndication); !ok {
+		t.Fatalf("expected PLI in output, got %T", out[0])
+	}
+}
+
+func TestRewriteKeyframeRequestsHandlesEmptyAndZeroSSRC(t *testing.T) {
+	if got := rewriteKeyframeRequests(nil, 12345); len(got) != 0 {
+		t.Fatalf("nil input must produce nil output, got %v", got)
+	}
+	if got := rewriteKeyframeRequests(
+		[]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: 1}},
+		0,
+	); len(got) != 0 {
+		t.Fatalf("publisherSSRC=0 must short-circuit, got %v", got)
 	}
 }
