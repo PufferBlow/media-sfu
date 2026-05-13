@@ -8,6 +8,10 @@
 *.so
 *.dylib
 
+# Default `go build` output for ./cmd/server (Linux/macOS produces a bare
+# `server` file with no extension, which the *.exe rule above doesn't catch).
+/server
+
 # Test binary, built with `go test -c`
 *.test
 
