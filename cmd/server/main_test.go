@@ -451,3 +451,144 @@ func TestRewriteKeyframeRequestsHandlesEmptyAndZeroSSRC(t *testing.T) {
 		t.Fatalf("publisherSSRC=0 must short-circuit, got %v", got)
 	}
 }
+
+// ─────────────────────────────────────────────
+// REMB aggregation (M2)
+// ─────────────────────────────────────────────
+
+func TestExtractMaxBitrateBPSFindsREMB(t *testing.T) {
+	// REMB Bitrate is a float32; test the typical case of a single
+	// receiver-emitted estimate.
+	got := extractMaxBitrateBPS([]rtcp.Packet{
+		&rtcp.ReceiverEstimatedMaximumBitrate{Bitrate: 800_000},
+	})
+	if got != 800_000 {
+		t.Fatalf("expected 800_000 bps, got %d", got)
+	}
+}
+
+func TestExtractMaxBitrateBPSPicksMaxAcrossPackets(t *testing.T) {
+	got := extractMaxBitrateBPS([]rtcp.Packet{
+		&rtcp.ReceiverEstimatedMaximumBitrate{Bitrate: 600_000},
+		&rtcp.ReceiverEstimatedMaximumBitrate{Bitrate: 1_200_000},
+		&rtcp.PictureLossIndication{MediaSSRC: 1},
+	})
+	if got != 1_200_000 {
+		t.Fatalf("expected the larger REMB to win, got %d", got)
+	}
+}
+
+func TestExtractMaxBitrateBPSIgnoresNonREMB(t *testing.T) {
+	if got := extractMaxBitrateBPS([]rtcp.Packet{
+		&rtcp.PictureLossIndication{MediaSSRC: 1},
+		&rtcp.FullIntraRequest{},
+	}); got != 0 {
+		t.Fatalf("only PLI/FIR in input — expected 0, got %d", got)
+	}
+	if got := extractMaxBitrateBPS(nil); got != 0 {
+		t.Fatalf("nil input — expected 0, got %d", got)
+	}
+}
+
+// rt.recordReceiverREMB on a fresh track should return the value the
+// caller just recorded (it's the only receiver so min == its value).
+func TestRoomTrackRecordReceiverREMBSingleReceiver(t *testing.T) {
+	rt := &roomTrack{}
+	got := rt.recordReceiverREMB("alice", 500_000)
+	if got != 500_000 {
+		t.Fatalf("single-receiver aggregate must equal that receiver's value, got %d", got)
+	}
+}
+
+// The aggregate is the MIN across receivers — the slow receiver
+// determines the cap so the publisher reduces enough for everyone.
+func TestRoomTrackRecordReceiverREMBMinAcrossReceivers(t *testing.T) {
+	rt := &roomTrack{}
+	_ = rt.recordReceiverREMB("alice", 2_000_000)
+	got := rt.recordReceiverREMB("bob", 600_000)
+	if got != 600_000 {
+		t.Fatalf("aggregate must be min(2M, 600k) = 600k, got %d", got)
+	}
+	// Updating Bob upward shouldn't pull the aggregate up if Alice is now
+	// the slowest — but Alice was 2M, Bob is now 1.5M, so Bob still wins.
+	got = rt.recordReceiverREMB("bob", 1_500_000)
+	if got != 1_500_000 {
+		t.Fatalf("aggregate must follow new min(2M, 1.5M) = 1.5M, got %d", got)
+	}
+}
+
+// Forgetting a receiver lifts the cap to the next-slowest. Critical
+// behavior: when a slow receiver leaves, the publisher should be free
+// to send at higher quality to the remaining (faster) receivers.
+func TestRoomTrackForgetReceiverREMBLiftsAggregate(t *testing.T) {
+	rt := &roomTrack{}
+	_ = rt.recordReceiverREMB("alice", 2_000_000)
+	_ = rt.recordReceiverREMB("bob", 400_000) // the slow one
+	got := rt.forgetReceiverREMB("bob")
+	if got != 2_000_000 {
+		t.Fatalf("dropping the slow receiver must lift aggregate to 2M, got %d", got)
+	}
+	// Forgetting the last receiver returns 0, meaning "no cap from REMB."
+	got = rt.forgetReceiverREMB("alice")
+	if got != 0 {
+		t.Fatalf("dropping the last receiver must return 0, got %d", got)
+	}
+}
+
+// Receivers that report 0 (transient state, no estimate yet) shouldn't
+// pin the aggregate to 0 — they're filtered out.
+func TestRoomTrackComputeAggregateIgnoresZero(t *testing.T) {
+	rt := &roomTrack{}
+	_ = rt.recordReceiverREMB("alice", 500_000)
+	got := rt.recordReceiverREMB("bob", 0)
+	if got != 500_000 {
+		t.Fatalf("zero from one receiver must not zero the aggregate, got %d", got)
+	}
+}
+
+// shouldForwardREMB on a fresh track always greenlights the first
+// forward (last==0). Subsequent forwards are gated by delta or
+// heartbeat interval.
+func TestRoomTrackShouldForwardREMBFirstSendAlwaysFires(t *testing.T) {
+	rt := &roomTrack{}
+	if !rt.shouldForwardREMB(800_000, time.Unix(100, 0)) {
+		t.Fatalf("first forward should always fire")
+	}
+	// Calling again with the same value within the heartbeat window
+	// should NOT re-fire (delta=0, within 2s).
+	if rt.shouldForwardREMB(800_000, time.Unix(101, 0)) {
+		t.Fatalf("same value within heartbeat should be skipped")
+	}
+}
+
+// A >20% jump unblocks immediately even within the heartbeat window —
+// the encoder needs to know about big swings without waiting.
+func TestRoomTrackShouldForwardREMBSignificantDelta(t *testing.T) {
+	rt := &roomTrack{}
+	_ = rt.shouldForwardREMB(1_000_000, time.Unix(100, 0))
+	// 21% drop, 100ms later: must fire.
+	if !rt.shouldForwardREMB(790_000, time.Unix(100, int64(100*time.Millisecond))) {
+		t.Fatalf("significant delta should fire even inside heartbeat")
+	}
+}
+
+// After heartbeatInterval elapses, the same value should re-fire as a
+// keepalive so a stable cap eventually gets honored even after a
+// network blip put the receiver into a quiet steady state.
+func TestRoomTrackShouldForwardREMBHeartbeat(t *testing.T) {
+	rt := &roomTrack{}
+	_ = rt.shouldForwardREMB(1_000_000, time.Unix(100, 0))
+	// 3 seconds later, same value: should fire as heartbeat.
+	if !rt.shouldForwardREMB(1_000_000, time.Unix(103, 0)) {
+		t.Fatalf("heartbeat should fire after >2s elapsed")
+	}
+}
+
+// Zero aggregate (no receivers) is never forwarded — we'd be telling
+// the publisher to send 0 bps, which would mute the stream.
+func TestRoomTrackShouldForwardREMBZeroNeverFires(t *testing.T) {
+	rt := &roomTrack{}
+	if rt.shouldForwardREMB(0, time.Unix(100, 0)) {
+		t.Fatalf("aggregate=0 must never fire a forward")
+	}
+}

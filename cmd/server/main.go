@@ -286,10 +286,109 @@ func (p *peer) setState(muted, deafened, speaking bool) (changed bool) {
 // the receiver-side RTCP drain can forward PLI / FIR back to the publisher.
 // Receivers asking for a keyframe is how video recovers after packet loss;
 // without this association we'd silently swallow those requests.
+//
+// REMB state lives here too. Each receiver of a fanned-out video track
+// emits ReceiverEstimatedMaximumBitrate packets reporting its downlink
+// estimate; the SFU aggregates the min across all current receivers and
+// forwards that as a single REMB to the publisher. The publisher's
+// browser encoder then throttles to the cap. Audio tracks don't use
+// REMB (opus doesn't negotiate the goog-remb feedback), so for audio
+// the maps stay empty and the aggregation logic is a no-op.
 type roomTrack struct {
 	Local      *webrtc.TrackLocalStaticRTP
 	Publisher  *peer
 	RemoteSSRC uint32
+
+	// REMB state. rembMu guards all three fields.
+	rembMu          sync.Mutex
+	rembPerReceiver map[string]uint64 // receiver_user_id -> latest REMB in bps
+	lastSentREMB    uint64            // last bps value we forwarded to publisher; 0 = nothing sent yet
+	lastSentREMBAt  time.Time         // throttle baseline
+}
+
+// recordReceiverREMB updates the receiver's latest REMB and returns the
+// new aggregate (min across all known receivers, in bps). Idempotent
+// when the value is unchanged; the caller still gets back the current
+// aggregate so it can decide whether to forward.
+func (rt *roomTrack) recordReceiverREMB(receiverUserID string, bitrateBPS uint64) uint64 {
+	rt.rembMu.Lock()
+	defer rt.rembMu.Unlock()
+	if rt.rembPerReceiver == nil {
+		rt.rembPerReceiver = make(map[string]uint64)
+	}
+	rt.rembPerReceiver[receiverUserID] = bitrateBPS
+	return rt.computeAggregateLocked()
+}
+
+// forgetReceiverREMB drops a receiver's REMB record. Called when a peer
+// disconnects so the aggregate doesn't stay pinned low because of a
+// receiver that left while reporting a bad estimate. Returns the
+// post-removal aggregate; 0 means no receivers remain (the publisher's
+// cap should be lifted).
+func (rt *roomTrack) forgetReceiverREMB(receiverUserID string) uint64 {
+	rt.rembMu.Lock()
+	defer rt.rembMu.Unlock()
+	if rt.rembPerReceiver == nil {
+		return 0
+	}
+	delete(rt.rembPerReceiver, receiverUserID)
+	return rt.computeAggregateLocked()
+}
+
+// computeAggregateLocked returns the min REMB across all current
+// receivers. Caller must hold rembMu.
+func (rt *roomTrack) computeAggregateLocked() uint64 {
+	var aggregate uint64
+	for _, bps := range rt.rembPerReceiver {
+		if bps == 0 {
+			continue
+		}
+		if aggregate == 0 || bps < aggregate {
+			aggregate = bps
+		}
+	}
+	return aggregate
+}
+
+// shouldForwardREMB decides whether a fresh aggregate is worth pushing
+// to the publisher. Two triggers:
+//
+//  1. Significant delta (>20%) from what we last sent. Tightens the
+//     loop when the network is changing.
+//  2. >2 seconds since the last send. Acts as a heartbeat so a stable
+//     low-bandwidth receiver eventually gets honored even after the
+//     initial cap is set.
+//
+// Caller passes the current time so tests don't have to monkey-patch
+// the clock. Returns true and atomically records the new send when
+// the answer is yes.
+func (rt *roomTrack) shouldForwardREMB(aggregate uint64, now time.Time) bool {
+	if aggregate == 0 {
+		return false
+	}
+	rt.rembMu.Lock()
+	defer rt.rembMu.Unlock()
+	last := rt.lastSentREMB
+	lastAt := rt.lastSentREMBAt
+
+	const significantDelta = 0.20
+	const heartbeatInterval = 2 * time.Second
+
+	var delta float64
+	if last == 0 {
+		delta = 1.0
+	} else if aggregate > last {
+		delta = float64(aggregate-last) / float64(last)
+	} else {
+		delta = float64(last-aggregate) / float64(last)
+	}
+
+	if delta >= significantDelta || now.Sub(lastAt) >= heartbeatInterval {
+		rt.lastSentREMB = aggregate
+		rt.lastSentREMBAt = now
+		return true
+	}
+	return false
 }
 
 type room struct {
@@ -1090,8 +1189,9 @@ func (s *sfuServer) addTrackToPeer(target *peer, rt *roomTrack) error {
 	// Drain RTCP from the receiver and forward picture-loss feedback back to
 	// the publisher so video can recover after packet loss. Without this the
 	// sender would stall (drain is required by pion) AND receivers asking for
-	// a keyframe would be silently swallowed.
-	go s.forwardReceiverRTCP(sender, rt)
+	// a keyframe would be silently swallowed. The receiver's user_id is
+	// threaded through so REMB reports can be aggregated per publisher.
+	go s.forwardReceiverRTCP(sender, rt, target.UserID)
 
 	offer, err := target.PC.CreateOffer(nil)
 	if err != nil {
@@ -1135,6 +1235,26 @@ func rewriteKeyframeRequests(packets []rtcp.Packet, publisherSSRC uint32) []rtcp
 	return out
 }
 
+// extractMaxBitrateBPS pulls the highest REMB value out of an RTCP batch.
+// Each REMB packet carries a single bandwidth estimate; in practice a
+// receiver emits one REMB per batch but we tolerate multiple by taking
+// the max (the receiver's "I think I can handle up to this" cap).
+// Returns 0 when no REMB packet is present.
+func extractMaxBitrateBPS(packets []rtcp.Packet) uint64 {
+	var max uint64
+	for _, pkt := range packets {
+		remb, ok := pkt.(*rtcp.ReceiverEstimatedMaximumBitrate)
+		if !ok {
+			continue
+		}
+		bps := uint64(remb.Bitrate)
+		if bps > max {
+			max = bps
+		}
+	}
+	return max
+}
+
 // forwardReceiverRTCP pumps RTCP from a receiver's RTPSender. Picture-loss
 // indications (PLI) and full-intra requests (FIR) are rewritten with the
 // publisher's SSRC and re-emitted on the publisher's peer connection so the
@@ -1146,18 +1266,60 @@ func rewriteKeyframeRequests(packets []rtcp.Packet, publisherSSRC uint32) []rtcp
 // away or the connection is closed). Publisher write failures are logged
 // at debug because the publisher may have disconnected too, in which case
 // the receiver fanout is about to tear down anyway.
-func (s *sfuServer) forwardReceiverRTCP(sender *webrtc.RTPSender, rt *roomTrack) {
+func (s *sfuServer) forwardReceiverRTCP(sender *webrtc.RTPSender, rt *roomTrack, receiverUserID string) {
 	if sender == nil || rt == nil {
 		return
 	}
 	for {
 		packets, _, readErr := sender.ReadRTCP()
 		if readErr != nil {
+			// Receiver gone — forget their REMB so the aggregate
+			// updates to reflect only currently-connected receivers.
+			// The new aggregate is intentionally NOT forwarded here:
+			// the publisher will pick up the change on the next
+			// REMB report from any remaining receiver, and emitting
+			// an unsolicited "lift the cap" right at peer-leave time
+			// can race with the addTrackToPeer goroutine if a new
+			// receiver is joining concurrently.
+			rt.forgetReceiverREMB(receiverUserID)
 			return
 		}
 		if rt.Publisher == nil || rt.Publisher.PC == nil || rt.RemoteSSRC == 0 {
 			continue
 		}
+
+		// Aggregate REMB across all receivers and forward to publisher
+		// when the aggregate has moved enough to matter. Done before
+		// the PLI/FIR rewrite because the two paths are independent —
+		// a single RTCP batch can carry both a REMB and a PLI.
+		if rembBPS := extractMaxBitrateBPS(packets); rembBPS > 0 {
+			aggregate := rt.recordReceiverREMB(receiverUserID, rembBPS)
+			if aggregate > 0 && rt.shouldForwardREMB(aggregate, time.Now()) {
+				outgoing := &rtcp.ReceiverEstimatedMaximumBitrate{
+					SenderSSRC: 0,
+					Bitrate:    float32(aggregate),
+					SSRCs:      []uint32{rt.RemoteSSRC},
+				}
+				if err := rt.Publisher.PC.WriteRTCP([]rtcp.Packet{outgoing}); err != nil {
+					s.log.Debug("publisher REMB write failed",
+						"publisher_user_id", rt.Publisher.UserID,
+						"remote_ssrc", rt.RemoteSSRC,
+						"bps", aggregate,
+						"err", err,
+					)
+				} else {
+					// Don't log receiver_count here — the field lives
+					// under rembMu and a debug-line shouldn't grab the
+					// lock again on every forward.
+					s.log.Debug("forwarded aggregated REMB to publisher",
+						"publisher_user_id", rt.Publisher.UserID,
+						"remote_ssrc", rt.RemoteSSRC,
+						"bps", aggregate,
+					)
+				}
+			}
+		}
+
 		toForward := rewriteKeyframeRequests(packets, rt.RemoteSSRC)
 		if len(toForward) == 0 {
 			continue
