@@ -176,8 +176,13 @@ type participantSnapshot struct {
 	IsMuted     bool   `json:"is_muted"`
 	IsDeafened  bool   `json:"is_deafened"`
 	IsSpeaking  bool   `json:"is_speaking"`
-	Scope       string `json:"scope"`
-	ConnectedAt string `json:"connected_at"`
+	// IsSharingScreen lets a newcomer learn "user X is already publishing
+	// a screen share track" at join time, so the client can bind the
+	// incoming video track to user X without waiting for a separate
+	// screen_share_started broadcast that already fired before they joined.
+	IsSharingScreen bool   `json:"is_sharing_screen"`
+	Scope           string `json:"scope"`
+	ConnectedAt     string `json:"connected_at"`
 }
 
 // ─────────────────────────────────────────────
@@ -201,10 +206,11 @@ type peer struct {
 	// State fields — guarded by stateMu, NOT the room lock.
 	// Separating this mutex avoids holding the room lock during snapshot
 	// iteration while audio_state messages are being processed concurrently.
-	stateMu    sync.RWMutex
-	IsMuted    bool
-	IsDeafened bool
-	IsSpeaking bool
+	stateMu         sync.RWMutex
+	IsMuted         bool
+	IsDeafened      bool
+	IsSpeaking      bool
+	IsSharingScreen bool
 }
 
 func (p *peer) send(msg signalMessage) error {
@@ -233,14 +239,29 @@ func (p *peer) snapshot() participantSnapshot {
 	p.stateMu.RLock()
 	defer p.stateMu.RUnlock()
 	return participantSnapshot{
-		UserID:      p.UserID,
-		Username:    p.Username,
-		IsMuted:     p.IsMuted,
-		IsDeafened:  p.IsDeafened,
-		IsSpeaking:  p.IsSpeaking,
-		Scope:       p.Scope,
-		ConnectedAt: p.ConnectedAt.UTC().Format(time.RFC3339),
+		UserID:          p.UserID,
+		Username:        p.Username,
+		IsMuted:         p.IsMuted,
+		IsDeafened:      p.IsDeafened,
+		IsSpeaking:      p.IsSpeaking,
+		IsSharingScreen: p.IsSharingScreen,
+		Scope:           p.Scope,
+		ConnectedAt:     p.ConnectedAt.UTC().Format(time.RFC3339),
 	}
+}
+
+// setSharingScreen atomically updates the screen-share flag. Returns true
+// if the value changed (i.e. the caller should broadcast). Idempotent so
+// a client re-sending screen_share_started during a reconnect doesn't
+// emit duplicate broadcasts.
+func (p *peer) setSharingScreen(sharing bool) (changed bool) {
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+	if p.IsSharingScreen != sharing {
+		p.IsSharingScreen = sharing
+		changed = true
+	}
+	return
 }
 
 // setState updates the peer's audio state fields under the state lock.
@@ -1287,6 +1308,22 @@ func (s *sfuServer) removePeer(r *room, p *peer, reason string) {
 		"was_muted":  snap.IsMuted,
 	})
 
+	// If the departing peer was publishing a screen share, tell everyone
+	// else to tear down their remote video tile. participant_left alone
+	// isn't enough because clients use that to update participant lists
+	// — the dedicated stop signal is what unbinds the video element.
+	if snap.IsSharingScreen {
+		s.broadcastRoom(r, signalMessage{
+			Type:      "screen_share_stopped",
+			SessionID: r.SessionID,
+			Payload: map[string]any{
+				"user_id":  p.UserID,
+				"username": p.Username,
+				"reason":   "disconnect",
+			},
+		}, p.UserID)
+	}
+
 	s.broadcastRoom(r, signalMessage{
 		Type:      "participant_left",
 		SessionID: r.SessionID,
@@ -1757,6 +1794,45 @@ func (s *sfuServer) handleWS(w http.ResponseWriter, r *http.Request) {
 					"is_deafened": newDeafened,
 				},
 			}, "")
+
+		case "screen_share_started", "screen_share_stopped":
+			// Screen-share announce. Carries no payload from the client —
+			// the message type itself is the signal. The SFU enforces
+			// send_video at OnTrack time, so a malicious client without
+			// send_video scope can still announce but their actual video
+			// track will be rejected. That's fine: the announce is just
+			// a hint for other clients to bind incoming video tracks to
+			// the right user.
+			sharing := msg.Type == "screen_share_started"
+			if !peerObj.setSharingScreen(sharing) {
+				// Already in this state — no-op, no broadcast. Lets the
+				// client re-send safely (e.g. after a reconnect) without
+				// causing duplicate UI events.
+				continue
+			}
+
+			s.log.Debug("peer screen share state changed",
+				"user_id", peerObj.UserID,
+				"is_sharing_screen", sharing,
+			)
+
+			s.emitInternalEvent("screen_share_changed", map[string]any{
+				"session_id":         roomObj.SessionID,
+				"channel_id":         roomObj.ChannelID,
+				"user_id":            peerObj.UserID,
+				"is_sharing_screen":  sharing,
+			})
+
+			// Broadcast to everyone else in the room. The sender already
+			// knows they started, so exclude them.
+			s.broadcastRoom(roomObj, signalMessage{
+				Type:      msg.Type,
+				SessionID: roomObj.SessionID,
+				Payload: map[string]any{
+					"user_id":  peerObj.UserID,
+					"username": peerObj.Username,
+				},
+			}, peerObj.UserID)
 
 		case "ping":
 			_ = peerObj.send(signalMessage{Type: "pong", SessionID: roomObj.SessionID})
