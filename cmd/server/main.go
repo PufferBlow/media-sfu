@@ -1816,6 +1816,13 @@ func (s *sfuServer) handleWS(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	// ── Signalling read loop ─────────────────────────
+	//
+	// Labelled so a graceful `leave` message can break the outer for-loop
+	// from inside the switch — plain `break` from a Go switch only exits
+	// the case, not the surrounding for. Falling out drops into the
+	// cleanup block below (close pingStop + removePeer), which is what
+	// we want when a client politely tells us it's done.
+readLoop:
 	for {
 		_, raw, readErr := conn.ReadMessage()
 		if readErr != nil {
@@ -1998,6 +2005,27 @@ func (s *sfuServer) handleWS(w http.ResponseWriter, r *http.Request) {
 
 		case "ping":
 			_ = peerObj.send(signalMessage{Type: "pong", SessionID: roomObj.SessionID})
+
+		case "leave":
+			// Client-initiated graceful exit. Without this case the SFU
+			// can only detect a departure by the WS close-frame reaching
+			// the read loop — which in tab-close / browser-quit
+			// scenarios can lag several seconds behind the user's
+			// intent, leaving the peer visible in everyone else's
+			// participant list as a ghost. An explicit signal lets us
+			// remove + broadcast `participant_left` immediately, then
+			// drop into the standard cleanup path.
+			//
+			// Ack is best-effort: by the time the client receives it
+			// they've usually already closed their socket. We send it
+			// anyway so cooperating clients can wait-for-ack before
+			// tearing down their UI on slow connections.
+			s.log.Debug("ws: explicit leave received",
+				"user_id", peerObj.UserID,
+				"session_id", peerObj.SessionID,
+			)
+			_ = peerObj.send(signalMessage{Type: "leave_ack", SessionID: roomObj.SessionID})
+			break readLoop
 
 		default:
 			s.log.Warn("ws: unsupported message type",
