@@ -171,11 +171,11 @@ type internalEvent struct {
 // ─────────────────────────────────────────────
 
 type participantSnapshot struct {
-	UserID      string `json:"user_id"`
-	Username    string `json:"username,omitempty"`
-	IsMuted     bool   `json:"is_muted"`
-	IsDeafened  bool   `json:"is_deafened"`
-	IsSpeaking  bool   `json:"is_speaking"`
+	UserID     string `json:"user_id"`
+	Username   string `json:"username,omitempty"`
+	IsMuted    bool   `json:"is_muted"`
+	IsDeafened bool   `json:"is_deafened"`
+	IsSpeaking bool   `json:"is_speaking"`
 	// IsSharingScreen lets a newcomer learn "user X is already publishing
 	// a screen share track" at join time, so the client can bind the
 	// incoming video track to user X without waiting for a separate
@@ -457,6 +457,14 @@ type MediaSFUConfig struct {
 	UDPPortMax            int    `toml:"udp_port_max"`
 	LogLevel              string `toml:"log_level"`
 	MetricsSecret         string `toml:"metrics_secret"`
+
+	// Multi-instance SFU registry (see pufferblow's media_sfu_instances
+	// table). All three are static per-deployment identity, not something
+	// the bootstrap-config response overrides.
+	InstanceID               string `toml:"instance_id"`
+	Region                   string `toml:"region"`
+	PublicSignalingURL       string `toml:"public_signaling_url"`
+	HeartbeatIntervalSeconds int    `toml:"heartbeat_interval_seconds"`
 }
 
 type TOMLConfig struct {
@@ -511,6 +519,13 @@ type sfuServer struct {
 	internalAPIBase string
 	internalSecret  string
 	metricsSecret   string // if set, /metrics requires X-Pufferblow-Signature
+
+	// Multi-instance registry identity (see pufferblow's media_sfu_instances
+	// table) — reported on every heartbeat, never overridden by bootstrap-config.
+	instanceID         string
+	region             string
+	publicSignalingURL string
+	heartbeatInterval  time.Duration
 
 	maxTotalPeers int
 	maxRoomPeers  int
@@ -649,21 +664,37 @@ func newServer(configPath string) (*sfuServer, error) {
 	httpTimeout := time.Duration(integer(tomlConfig.HTTPTimeoutSeconds, 5)) * time.Second
 	metricsSecret := str(tomlConfig.MetricsSecret, "")
 
+	// ── instance registry identity ─────────────────────
+	// instance_id has no safe default that stays stable across restarts
+	// without operator input, but the registry degrades gracefully either
+	// way: an unconfigured instance just registers under a fresh random id
+	// each restart, which only matters for dashboards, not correctness.
+	instanceID := str(tomlConfig.InstanceID, randomInstanceID())
+	region := str(tomlConfig.Region, "default")
+	publicSignalingURL := strings.TrimSpace(tomlConfig.PublicSignalingURL)
+	heartbeatInterval := dur(
+		durFromSec(tomlConfig.HeartbeatIntervalSeconds), 10*time.Second,
+	)
+
 	server := &sfuServer{
-		bindAddr:      bindAddr,
-		metricsSecret: metricsSecret,
-		maxTotalPeers: maxTotalPeers,
-		maxRoomPeers:  maxRoomPeers,
-		roomEndGrace:  time.Duration(roomEndGrace) * time.Second,
-		readLimit:     readLimit,
-		writeTimeout:  writeTimeout,
-		pingInterval:  pingInterval,
-		pongWait:      pongWait,
-		eventWorkers:  eventWorkers,
-		eventQueue:    make(chan internalEvent, eventQSize),
-		httpClient:    &http.Client{Timeout: httpTimeout},
-		rooms:         map[string]*room{},
-		roomEnd:       map[string]*time.Timer{},
+		bindAddr:           bindAddr,
+		metricsSecret:      metricsSecret,
+		instanceID:         instanceID,
+		region:             region,
+		publicSignalingURL: publicSignalingURL,
+		heartbeatInterval:  heartbeatInterval,
+		maxTotalPeers:      maxTotalPeers,
+		maxRoomPeers:       maxRoomPeers,
+		roomEndGrace:       time.Duration(roomEndGrace) * time.Second,
+		readLimit:          readLimit,
+		writeTimeout:       writeTimeout,
+		pingInterval:       pingInterval,
+		pongWait:           pongWait,
+		eventWorkers:       eventWorkers,
+		eventQueue:         make(chan internalEvent, eventQSize),
+		httpClient:         &http.Client{Timeout: httpTimeout},
+		rooms:              map[string]*room{},
+		roomEnd:            map[string]*time.Timer{},
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  8192,
 			WriteBufferSize: 8192,
@@ -1069,6 +1100,74 @@ func (s *sfuServer) startEventWorkers() {
 			s.log.Debug("internal event worker stopped", "worker_id", workerID)
 		}(id)
 	}
+}
+
+func randomInstanceID() string {
+	buf := make([]byte, 8)
+	if _, err := rand.Read(buf); err != nil {
+		return "sfu-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	return "sfu-" + hex.EncodeToString(buf)
+}
+
+// ─────────────────────────────────────────────
+// Instance registry heartbeat
+// ─────────────────────────────────────────────
+
+// startHeartbeatLoop periodically reports this instance's identity and load
+// into pufferblow's media_sfu_instances registry so create_or_join_session
+// can route new sessions here. A no-op (with a one-time warning) when
+// public_signaling_url isn't configured — single-instance deployments don't
+// need the registry at all, since pufferblow's own hardcoded signaling_url
+// fallback already works for them.
+func (s *sfuServer) startHeartbeatLoop() {
+	if s.publicSignalingURL == "" {
+		s.log.Warn("public_signaling_url not set — skipping instance registry heartbeat (single-instance mode)")
+		return
+	}
+
+	go func() {
+		s.postHeartbeat()
+		ticker := time.NewTicker(s.heartbeatInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			s.postHeartbeat()
+		}
+	}()
+}
+
+func (s *sfuServer) postHeartbeat() {
+	body, _ := json.Marshal(map[string]any{
+		"instance_id":     s.instanceID,
+		"region":          s.region,
+		"signaling_url":   s.publicSignalingURL,
+		"current_peers":   s.totalPeers.Load(),
+		"max_total_peers": s.maxTotalPeers,
+	})
+	endpoint := s.internalAPIBase + "/instances/heartbeat"
+
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		s.log.Error("heartbeat: failed to build request", "err", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Pufferblow-Signature", signPayload(s.internalSecret, body))
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		s.log.Error("heartbeat: POST failed", "err", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(resp.Body)
+		s.log.Warn("heartbeat: backend rejected heartbeat",
+			"status", resp.StatusCode, "body", string(data))
+		return
+	}
+	s.log.Debug("heartbeat: delivered", "status", resp.StatusCode)
 }
 
 func signPayload(secret string, body []byte) string {
@@ -1979,10 +2078,10 @@ func (s *sfuServer) handleWS(w http.ResponseWriter, r *http.Request) {
 			)
 
 			s.emitInternalEvent("screen_share_changed", map[string]any{
-				"session_id":         roomObj.SessionID,
-				"channel_id":         roomObj.ChannelID,
-				"user_id":            peerObj.UserID,
-				"is_sharing_screen":  sharing,
+				"session_id":        roomObj.SessionID,
+				"channel_id":        roomObj.ChannelID,
+				"user_id":           peerObj.UserID,
+				"is_sharing_screen": sharing,
 			})
 
 			// Broadcast to everyone else in the room. The sender already
@@ -2175,6 +2274,7 @@ func main() {
 	}
 
 	server.startEventWorkers()
+	server.startHeartbeatLoop()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", server.healthz)

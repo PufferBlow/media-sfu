@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -590,5 +592,79 @@ func TestRoomTrackShouldForwardREMBZeroNeverFires(t *testing.T) {
 	rt := &roomTrack{}
 	if rt.shouldForwardREMB(0, time.Unix(100, 0)) {
 		t.Fatalf("aggregate=0 must never fire a forward")
+	}
+}
+
+// ─────────────────────────────────────────────
+// Instance registry heartbeat
+// ─────────────────────────────────────────────
+
+func TestRandomInstanceIDIsUniqueAndPrefixed(t *testing.T) {
+	a := randomInstanceID()
+	b := randomInstanceID()
+	if a == b {
+		t.Fatalf("expected two distinct random instance ids, got %q twice", a)
+	}
+	if !strings.HasPrefix(a, "sfu-") || !strings.HasPrefix(b, "sfu-") {
+		t.Fatalf("expected ids prefixed with sfu-, got %q and %q", a, b)
+	}
+}
+
+func TestPostHeartbeatSendsSignedPayload(t *testing.T) {
+	const secret = "heartbeat-secret"
+
+	var gotBody []byte
+	var gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		body := make([]byte, r.ContentLength)
+		_, _ = r.Body.Read(body)
+		gotBody = body
+
+		expectedSig := signPayload(secret, body)
+		if r.Header.Get("X-Pufferblow-Signature") != expectedSig {
+			t.Errorf("signature mismatch: got %q want %q",
+				r.Header.Get("X-Pufferblow-Signature"), expectedSig)
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	s := &sfuServer{
+		internalAPIBase:    server.URL,
+		internalSecret:     secret,
+		instanceID:         "sfu-test",
+		region:             "eu-west",
+		publicSignalingURL: "wss://sfu-a.example.com/rtc/v1/ws",
+		maxTotalPeers:      100,
+		httpClient:         server.Client(),
+		log:                slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	s.totalPeers.Store(7)
+
+	s.postHeartbeat()
+
+	if gotPath != "/instances/heartbeat" {
+		t.Fatalf("expected POST to /instances/heartbeat, got %q", gotPath)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(gotBody, &payload); err != nil {
+		t.Fatalf("failed to unmarshal heartbeat body: %v", err)
+	}
+	if payload["instance_id"] != "sfu-test" {
+		t.Errorf("expected instance_id=sfu-test, got %v", payload["instance_id"])
+	}
+	if payload["region"] != "eu-west" {
+		t.Errorf("expected region=eu-west, got %v", payload["region"])
+	}
+	if payload["signaling_url"] != "wss://sfu-a.example.com/rtc/v1/ws" {
+		t.Errorf("expected configured public signaling url, got %v", payload["signaling_url"])
+	}
+	if payload["current_peers"] != float64(7) {
+		t.Errorf("expected current_peers=7, got %v", payload["current_peers"])
+	}
+	if payload["max_total_peers"] != float64(100) {
+		t.Errorf("expected max_total_peers=100, got %v", payload["max_total_peers"])
 	}
 }
