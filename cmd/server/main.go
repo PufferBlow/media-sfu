@@ -250,6 +250,14 @@ func (p *peer) snapshot() participantSnapshot {
 	}
 }
 
+// isDeafened reports whether the peer has muted all incoming audio on
+// their end. Safe to call without the room lock.
+func (p *peer) isDeafened() bool {
+	p.stateMu.RLock()
+	defer p.stateMu.RUnlock()
+	return p.IsDeafened
+}
+
 // setSharingScreen atomically updates the screen-share flag. Returns true
 // if the value changed (i.e. the caller should broadcast). Idempotent so
 // a client re-sending screen_share_started during a reconnect doesn't
@@ -1441,6 +1449,15 @@ func (s *sfuServer) forwardReceiverRTCP(sender *webrtc.RTPSender, rt *roomTrack,
 
 // handleRemoteTrack proxies RTP from a source peer to all other peers in the room.
 // Each fanout runs in a separate goroutine to avoid one slow peer blocking others.
+// handleRemoteTrack pumps RTP packets from one publisher's remote track to
+// a local forwarder track, with no codec or timing awareness at all — it's
+// a byte-level RTP relay. This is why Opus DTX (discontinuous transmission,
+// enabled by default per `media_quality.audio.dtx_enabled` on the control
+// plane) needs no special handling here: DTX just means the publisher's
+// encoder emits RTP packets less often during silence, and ReadRTP/WriteRTP
+// below don't care about packet cadence, sequence-number gaps, or payload
+// size — those are jitter-buffer/decoder concerns downstream of this
+// forwarder, not something the SFU interprets.
 func (s *sfuServer) handleRemoteTrack(r *room, srcPeer *peer, remoteTrack *webrtc.TrackRemote) {
 	trackKey := fmt.Sprintf("%s:%s", srcPeer.UserID, remoteTrack.ID())
 
@@ -1481,8 +1498,17 @@ func (s *sfuServer) handleRemoteTrack(r *room, srcPeer *peer, remoteTrack *webrt
 	r.Mu.Unlock()
 
 	// Fan out to existing peers in parallel — one goroutine per target.
+	// Deafened targets are skipped: they're not forwarding anyone's audio
+	// to themselves right now, so there's no point spending upload
+	// bandwidth/CPU building a sender they'll just discard. A peer that
+	// un-deafens only gets tracks published *after* that point this way —
+	// re-attaching everything already live when they un-deafen would need
+	// a client-driven "resync" request, which doesn't exist yet.
 	var wg sync.WaitGroup
 	for _, target := range targets {
+		if target.isDeafened() {
+			continue
+		}
 		wg.Add(1)
 		go func(t *peer) {
 			defer wg.Done()
@@ -1847,8 +1873,10 @@ func (s *sfuServer) handleWS(w http.ResponseWriter, r *http.Request) {
 		"existing_tracks", len(existingTracks),
 	)
 
-	// Fan existing tracks to the new peer in parallel.
-	if len(existingTracks) > 0 {
+	// Fan existing tracks to the new peer in parallel — skipped entirely if
+	// the new peer joined already deafened (see the symmetric skip in
+	// handleRemoteTrack for why).
+	if len(existingTracks) > 0 && !peerObj.isDeafened() {
 		var wg sync.WaitGroup
 		for _, t := range existingTracks {
 			wg.Add(1)

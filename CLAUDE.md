@@ -60,6 +60,16 @@ Config is **not** read from environment variables or CLI flags (other than `-con
 
 `bootstrap_secret` in the local TOML is the one thing that must be present locally (it's not something the bootstrap call can provide — it's used to authenticate the bootstrap call itself). Startup fails fast if it's missing.
 
+Four more static, per-deployment identity fields are also local-only (never overridden by bootstrap-config, unlike the operational tuning values above): `instance_id`, `region`, `public_signaling_url`, `heartbeat_interval_seconds` (default 10s) — see the multi-instance registry section below. `instance_id` falls back to a fresh random one (`randomInstanceID`) each restart if unset, which only affects dashboards, not correctness.
+
+## Multi-instance registry
+
+Pufferblow (the control plane) can run more than one `media-sfu` deployment behind it and route new voice sessions to whichever is least loaded — e.g. for geographic distribution or horizontal scaling. Each `media-sfu` instance is just another copy of this same binary with its own `region`/`public_signaling_url`/`bind_addr`; there's no separate "router" service.
+
+`startHeartbeatLoop` (started from `main()` alongside `startEventWorkers`) POSTs `{instance_id, region, signaling_url, current_peers, max_total_peers}` to the Pufferblow API's `/api/internal/v1/voice/instances/heartbeat` every `heartbeat_interval_seconds`, signed with `internal_secret` the same way `postInternalEvent` signs lifecycle events. It's a no-op (one warning log, no goroutine started) if `public_signaling_url` isn't set — a single-instance deployment doesn't need this at all, since the control plane's own hardcoded `RTC_SIGNALING_URL` fallback already works for it.
+
+The control plane marks an instance `dead` after ~30s of missed heartbeats and routes new/reconnecting sessions elsewhere; this SFU process doesn't know or care that it's been marked dead — it just keeps heartbeating, and starts getting routed new sessions again automatically once its heartbeats resume.
+
 ## Architecture: bootstrap, auth, and the control-plane relationship
 
 On startup (`newServer` → `fetchBootstrapConfigWithRetry`):
@@ -76,7 +86,7 @@ Participant lifecycle events (`participant_joined`, `participant_left`, `state_c
 
 - **Room** = one voice channel session (`sessionID` keyed), holding a map of `peer`s and a map of `roomTrack`s. Created lazily on first join (`getOrCreateRoom`), torn down after a grace period (`room_end_grace_seconds`, default 15s) once empty (`scheduleRoomEndGrace`) — the grace period absorbs quick reconnects without flapping `session_ended` events to the API.
 - **Peer** = one WebSocket + one `pion` `PeerConnection`. Mute/deafen/speaking/screen-share state is guarded by its own `stateMu`, deliberately separate from the room's lock, so that broadcasting participant snapshots never has to hold the room lock while touching per-peer state (see the comment on the `peer` struct).
-- **Track fanout** (`handleRemoteTrack`): when a peer publishes a track, the SFU creates one `TrackLocalStaticRTP` per source track and fans it out to every other current room member in parallel goroutines (`addTrackToPeer` renegotiates via a fresh offer per target). New joiners get all currently-live tracks fanned to them the same way. This is an SFU, not an MCU — no mixing, just per-receiver forwarding, so peer count × track count drives the renegotiation fan-out cost.
+- **Track fanout** (`handleRemoteTrack`): when a peer publishes a track, the SFU creates one `TrackLocalStaticRTP` per source track and fans it out to every other current room member in parallel goroutines (`addTrackToPeer` renegotiates via a fresh offer per target). New joiners get all currently-live tracks fanned to them the same way. This is an SFU, not an MCU — no mixing, just per-receiver forwarding, so peer count × track count drives the renegotiation fan-out cost. Both fan-out paths skip any target peer that's currently deafened (`peer.isDeafened()`) — a deafened peer isn't listening to anyone, so there's no point spending upload bandwidth building them a sender; this only affects tracks published *while* deafened, un-deafening doesn't retroactively re-attach anything already skipped (no client-driven resync exists yet). Raw RTP forwarding here is codec/timing-agnostic by construction, which is also why Opus DTX (enabled by default, `media_quality.audio.dtx_enabled`) needs no special handling — see the comment on `handleRemoteTrack`.
 - **RTCP plumbing** (`forwardReceiverRTCP`): a goroutine per fanned-out track drains RTCP from each receiver's `RTPSender` (mandatory — pion stalls the sender otherwise) and:
   - Rewrites and re-emits PLI/FIR (keyframe requests) back to the original publisher with the publisher's SSRC substituted in (`rewriteKeyframeRequests`).
   - Aggregates REMB (bandwidth estimate) across all receivers of a track, taking the **minimum** reported bitrate, and forwards that aggregate to the publisher when it changes significantly (>20%) or every 2s as a heartbeat (`roomTrack.shouldForwardREMB`). This is how one slow receiver throttles the publisher's upload encoder for everyone.

@@ -596,6 +596,33 @@ func TestRoomTrackShouldForwardREMBZeroNeverFires(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────
+// Deafened-peer fan-out skip
+// ─────────────────────────────────────────────
+
+// handleRemoteTrack/the new-joiner fan-out both gate on peer.isDeafened()
+// before calling addTrackToPeer — this is the pure-logic half of that (no
+// live PeerConnection needed, same rationale as the RTCP/REMB helpers:
+// a real end-to-end fan-out assertion would need two bound pion
+// PeerConnections, which stress_test.go's harness deliberately doesn't do
+// — see its own comment on not simulating real RTP media).
+func TestPeerIsDeafenedReflectsSetState(t *testing.T) {
+	p := &peer{}
+	if p.isDeafened() {
+		t.Fatal("new peer should not start deafened")
+	}
+
+	p.setState(false /* muted */, true /* deafened */, false /* speaking */)
+	if !p.isDeafened() {
+		t.Fatal("expected isDeafened() to reflect setState(deafened=true)")
+	}
+
+	p.setState(false, false, false)
+	if p.isDeafened() {
+		t.Fatal("expected isDeafened() to reflect setState(deafened=false)")
+	}
+}
+
+// ─────────────────────────────────────────────
 // Instance registry heartbeat
 // ─────────────────────────────────────────────
 
