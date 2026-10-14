@@ -14,7 +14,42 @@ import (
 )
 
 // ─────────────────────────────────────────────
-// Internal event (SFU → Pufferblow backend)
+// Internal API (SFU → Pufferblow backend)
+// ─────────────────────────────────────────────
+
+func signPayload(secret string, body []byte) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
+}
+
+// postInternal POSTs payload as JSON to the Pufferblow API's internal
+// voice endpoint at path, signed with internal_secret, and returns the
+// response status and body.
+func (s *Server) postInternal(path string, payload any) (int, []byte, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, s.internalAPIBase+path, bytes.NewReader(body))
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Pufferblow-Signature", signPayload(s.internalSecret, body))
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, data, nil
+}
+
+// ─────────────────────────────────────────────
+// Internal events
 // ─────────────────────────────────────────────
 
 type internalEvent struct {
@@ -22,9 +57,22 @@ type internalEvent struct {
 	Payload   map[string]any
 }
 
-// ─────────────────────────────────────────────
-// Internal event workers
-// ─────────────────────────────────────────────
+// emitInternalEvent queues a lifecycle event for the Pufferblow API without
+// blocking: if the queue is full the event is dropped (and counted), since
+// stalling signaling or media is worse than a missed event.
+func (s *Server) emitInternalEvent(eventType string, payload map[string]any) {
+	event := internalEvent{EventType: eventType, Payload: payload}
+	select {
+	case s.eventQueue <- event:
+	default:
+		s.droppedInternalEvents.Add(1)
+		s.log.Warn("internal event dropped: queue full",
+			"event_type", eventType,
+			"queue_len", len(s.eventQueue),
+			"queue_cap", cap(s.eventQueue),
+		)
+	}
+}
 
 func (s *Server) startEventWorkers() {
 	for i := 0; i < s.eventWorkers; i++ {
@@ -39,6 +87,34 @@ func (s *Server) startEventWorkers() {
 	}
 }
 
+func (s *Server) postInternalEvent(event internalEvent) {
+	status, data, err := s.postInternal("/events", map[string]any{
+		"event_type": event.EventType,
+		"payload":    event.Payload,
+	})
+	if err != nil {
+		s.log.Error("internal event: POST failed",
+			"event_type", event.EventType, "err", err)
+		return
+	}
+	if status >= 300 {
+		s.log.Warn("internal event: backend rejected event",
+			"event_type", event.EventType,
+			"status", status,
+			"body", string(data),
+		)
+		return
+	}
+	s.log.Debug("internal event: delivered",
+		"event_type", event.EventType,
+		"status", status,
+	)
+}
+
+// ─────────────────────────────────────────────
+// Instance registry heartbeat
+// ─────────────────────────────────────────────
+
 func randomInstanceID() string {
 	buf := make([]byte, 8)
 	if _, err := rand.Read(buf); err != nil {
@@ -46,10 +122,6 @@ func randomInstanceID() string {
 	}
 	return "sfu-" + hex.EncodeToString(buf)
 }
-
-// ─────────────────────────────────────────────
-// Instance registry heartbeat
-// ─────────────────────────────────────────────
 
 // startHeartbeatLoop periodically reports this instance's identity and load
 // into pufferblow's media_sfu_instances registry so create_or_join_session
@@ -74,94 +146,21 @@ func (s *Server) startHeartbeatLoop() {
 }
 
 func (s *Server) postHeartbeat() {
-	body, _ := json.Marshal(map[string]any{
+	status, data, err := s.postInternal("/instances/heartbeat", map[string]any{
 		"instance_id":     s.instanceID,
 		"region":          s.region,
 		"signaling_url":   s.publicSignalingURL,
 		"current_peers":   s.totalPeers.Load(),
 		"max_total_peers": s.maxTotalPeers,
 	})
-	endpoint := s.internalAPIBase + "/instances/heartbeat"
-
-	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		s.log.Error("heartbeat: failed to build request", "err", err)
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Pufferblow-Signature", signPayload(s.internalSecret, body))
-
-	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		s.log.Error("heartbeat: POST failed", "err", err)
 		return
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 300 {
-		data, _ := io.ReadAll(resp.Body)
+	if status >= 300 {
 		s.log.Warn("heartbeat: backend rejected heartbeat",
-			"status", resp.StatusCode, "body", string(data))
+			"status", status, "body", string(data))
 		return
 	}
-	s.log.Debug("heartbeat: delivered", "status", resp.StatusCode)
-}
-
-func signPayload(secret string, body []byte) string {
-	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write(body)
-	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
-}
-
-func (s *Server) postInternalEvent(event internalEvent) {
-	body, _ := json.Marshal(map[string]any{
-		"event_type": event.EventType,
-		"payload":    event.Payload,
-	})
-	endpoint := s.internalAPIBase + "/events"
-
-	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		s.log.Error("internal event: failed to build request",
-			"event_type", event.EventType, "err", err)
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Pufferblow-Signature", signPayload(s.internalSecret, body))
-
-	resp, err := s.httpClient.Do(req)
-	if err != nil {
-		s.log.Error("internal event: POST failed",
-			"event_type", event.EventType, "err", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 300 {
-		data, _ := io.ReadAll(resp.Body)
-		s.log.Warn("internal event: backend rejected event",
-			"event_type", event.EventType,
-			"status", resp.StatusCode,
-			"body", string(data),
-		)
-		return
-	}
-	s.log.Debug("internal event: delivered",
-		"event_type", event.EventType,
-		"status", resp.StatusCode,
-	)
-}
-
-func (s *Server) emitInternalEvent(eventType string, payload map[string]any) {
-	event := internalEvent{EventType: eventType, Payload: payload}
-	select {
-	case s.eventQueue <- event:
-	default:
-		s.droppedInternalEvents.Add(1)
-		s.log.Warn("internal event dropped: queue full",
-			"event_type", eventType,
-			"queue_len", len(s.eventQueue),
-			"queue_cap", cap(s.eventQueue),
-		)
-	}
+	s.log.Debug("heartbeat: delivered", "status", status)
 }

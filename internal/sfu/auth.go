@@ -1,11 +1,9 @@
 package sfu
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 )
@@ -60,26 +58,14 @@ func (s *Server) consumeJoinToken(joinToken string) (*joinClaims, error) {
 	if strings.TrimSpace(joinToken) == "" {
 		return nil, errors.New("missing join token")
 	}
-	body, _ := json.Marshal(map[string]string{"join_token": joinToken})
-	endpoint := s.internalAPIBase + "/consume-join-token"
-
-	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	status, data, err := s.postInternal("/consume-join-token", map[string]string{"join_token": joinToken})
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Pufferblow-Signature", signPayload(s.internalSecret, body))
 
-	resp, err := s.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode != http.StatusOK {
+	if status != http.StatusOK {
 		if len(data) == 0 {
-			return nil, fmt.Errorf("join token consume failed: status %d", resp.StatusCode)
+			return nil, fmt.Errorf("join token consume failed: status %d", status)
 		}
 		return nil, fmt.Errorf("join token consume failed: %s", string(data))
 	}
