@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -85,4 +86,39 @@ func DefaultConfigPath() string {
 	}
 
 	return candidates[0]
+}
+
+// The or* helpers resolve one config value: the configured one if set
+// (non-blank, positive), the fallback otherwise.
+
+func orString(value, fallback string) string {
+	if strings.TrimSpace(value) != "" {
+		return value
+	}
+	return fallback
+}
+
+func orInt(value, fallback int) int {
+	if value > 0 {
+		return value
+	}
+	return fallback
+}
+
+// orDuration parses a Go duration string ("5s", "1m30s"); an unparsable
+// value falls back like a missing one.
+func orDuration(value string, fallback time.Duration) time.Duration {
+	if strings.TrimSpace(value) != "" {
+		if d, err := time.ParseDuration(value); err == nil {
+			return d
+		}
+	}
+	return fallback
+}
+
+func secondsOr(seconds int, fallback time.Duration) time.Duration {
+	if seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	return fallback
 }

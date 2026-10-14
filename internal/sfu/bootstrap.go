@@ -7,11 +7,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -74,6 +76,91 @@ type bootstrapConfigResponse struct {
 	StatusCode int                `json:"status_code"`
 	Config     sfuBootstrapConfig `json:"config"`
 	Detail     string             `json:"detail"`
+}
+
+// ─────────────────────────────────────────────
+// Bootstrap
+// ─────────────────────────────────────────────
+
+// fetchBootstrap fetches the bootstrap config the local [media-sfu] table
+// points at, retrying while the Pufferblow API comes up, and checks it
+// carries the credentials every later internal call needs.
+func fetchBootstrap(cfg *MediaSFUConfig, logger *slog.Logger) (*sfuBootstrapConfig, error) {
+	bootstrapURL := orString(cfg.BootstrapConfigURL,
+		"http://localhost:7575/api/internal/v1/voice/bootstrap-config")
+	bootstrapURL = strings.TrimRight(bootstrapURL, "/")
+
+	bootstrapSecret := strings.TrimSpace(cfg.BootstrapSecret)
+	if bootstrapSecret == "" {
+		return nil, errors.New("bootstrap_secret is required in config.toml [media-sfu]")
+	}
+
+	client := &http.Client{Timeout: orDuration(cfg.BootstrapHTTPTimeout, 5*time.Second)}
+	bootstrapCfg, err := fetchBootstrapConfigWithRetry(
+		client, bootstrapURL, bootstrapSecret,
+		orInt(cfg.BootstrapMaxRetries, 10),
+		orDuration(cfg.BootstrapRetryDelay, 3*time.Second),
+		logger,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("bootstrap config fetch failed after retries: %w", err)
+	}
+
+	if strings.TrimSpace(bootstrapCfg.InternalAPIBase) == "" {
+		return nil, errors.New("bootstrap config missing internal_api_base")
+	}
+	if strings.TrimSpace(bootstrapCfg.InternalSecret) == "" {
+		return nil, errors.New("bootstrap config missing internal_secret")
+	}
+	return bootstrapCfg, nil
+}
+
+// applyBootstrap takes the internal API credentials from the bootstrap
+// config, lets its operational values override local config where set,
+// and builds the WebRTC engine from it.
+func (s *Server) applyBootstrap(cfg *sfuBootstrapConfig) {
+	s.internalAPIBase = strings.TrimRight(cfg.InternalAPIBase, "/")
+	s.internalSecret = cfg.InternalSecret
+
+	if cfg.MaxTotalPeers > 0 {
+		s.maxTotalPeers = cfg.MaxTotalPeers
+	}
+	if cfg.MaxRoomPeers > 0 {
+		s.maxRoomPeers = cfg.MaxRoomPeers
+	}
+	if cfg.RoomEndGraceSeconds > 0 {
+		s.roomEndGrace = time.Duration(cfg.RoomEndGraceSeconds) * time.Second
+	}
+	if cfg.InternalEventWorkers > 0 {
+		s.eventWorkers = cfg.InternalEventWorkers
+	}
+	if cfg.InternalEventQueueSize >= 32 {
+		s.eventQueue = make(chan internalEvent, cfg.InternalEventQueueSize)
+	}
+	if cfg.InternalHTTPTimeoutSec > 0 {
+		s.httpClient = &http.Client{
+			Timeout: time.Duration(cfg.InternalHTTPTimeoutSec) * time.Second,
+		}
+	}
+	if cfg.WSWriteTimeoutSec > 0 {
+		s.writeTimeout = time.Duration(cfg.WSWriteTimeoutSec) * time.Second
+	}
+	if cfg.WSPongWaitSec > 0 {
+		s.pongWait = time.Duration(cfg.WSPongWaitSec) * time.Second
+	}
+	if cfg.WSPingIntervalSec > 0 {
+		s.pingInterval = time.Duration(cfg.WSPingIntervalSec) * time.Second
+	}
+	if s.pingInterval >= s.pongWait {
+		s.pingInterval = s.pongWait / 2
+	}
+	if cfg.WSReadLimitBytes > 0 {
+		s.readLimit = int64(cfg.WSReadLimitBytes)
+	}
+
+	s.webrtcAPI = newWebRTCAPI(cfg.UDPPortMin, cfg.UDPPortMax, s.log)
+	s.iceServers = parseBootstrapIceServers(cfg.IceServers)
+	s.mediaQuality = cfg.MediaQuality
 }
 
 // ─────────────────────────────────────────────

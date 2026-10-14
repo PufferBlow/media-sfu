@@ -116,6 +116,33 @@ func TestDefaultSharedConfigPathFallsBackToHomeCandidateWhenMissing(t *testing.T
 	}
 }
 
+func TestConfigValueFallbacks(t *testing.T) {
+	if got := orString("  ", "fallback"); got != "fallback" {
+		t.Errorf("blank string should fall back, got %q", got)
+	}
+	if got := orString("set", "fallback"); got != "set" {
+		t.Errorf("set string should win, got %q", got)
+	}
+	if got := orInt(0, 7); got != 7 {
+		t.Errorf("zero int should fall back, got %d", got)
+	}
+	if got := orInt(-1, 7); got != 7 {
+		t.Errorf("negative int should fall back, got %d", got)
+	}
+	if got := orDuration("1m30s", time.Second); got != 90*time.Second {
+		t.Errorf("valid duration should parse, got %v", got)
+	}
+	if got := orDuration("soon", time.Second); got != time.Second {
+		t.Errorf("unparsable duration should fall back, got %v", got)
+	}
+	if got := secondsOr(3, time.Minute); got != 3*time.Second {
+		t.Errorf("positive seconds should win, got %v", got)
+	}
+	if got := secondsOr(0, time.Minute); got != time.Minute {
+		t.Errorf("zero seconds should fall back, got %v", got)
+	}
+}
+
 func TestSignBootstrapPayload(t *testing.T) {
 	secret := "bootstrap-secret"
 	timestamp := int64(1_700_000_000)
