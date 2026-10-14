@@ -78,6 +78,14 @@ event_workers = 6
 	}
 }
 
+// setTestHome points os.UserHomeDir at dir: it reads HOME on Unix but
+// USERPROFILE on Windows.
+func setTestHome(t *testing.T, dir string) {
+	t.Helper()
+	t.Setenv("HOME", dir)
+	t.Setenv("USERPROFILE", dir)
+}
+
 func TestDefaultSharedConfigPathPrefersHomeConfig(t *testing.T) {
 	tempHome := t.TempDir()
 	sharedDir := filepath.Join(tempHome, ".pufferblow")
@@ -90,7 +98,7 @@ func TestDefaultSharedConfigPathPrefersHomeConfig(t *testing.T) {
 		t.Fatalf("write home config: %v", err)
 	}
 
-	t.Setenv("HOME", tempHome)
+	setTestHome(t, tempHome)
 
 	if got := defaultSharedConfigPath(); got != configPath {
 		t.Fatalf("expected home config path %q, got %q", configPath, got)
@@ -99,7 +107,7 @@ func TestDefaultSharedConfigPathPrefersHomeConfig(t *testing.T) {
 
 func TestDefaultSharedConfigPathFallsBackToHomeCandidateWhenMissing(t *testing.T) {
 	tempHome := t.TempDir()
-	t.Setenv("HOME", tempHome)
+	setTestHome(t, tempHome)
 
 	expected := filepath.Join(tempHome, ".pufferblow", "config.toml")
 	if got := defaultSharedConfigPath(); got != expected {
