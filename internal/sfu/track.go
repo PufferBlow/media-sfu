@@ -9,7 +9,7 @@ import (
 )
 
 // ─────────────────────────────────────────────
-// Room
+// Room tracks
 // ─────────────────────────────────────────────
 
 // roomTrack ties a fanned-out local RTP track to its source peer + SSRC so

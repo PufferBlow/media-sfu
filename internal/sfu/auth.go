@@ -9,7 +9,7 @@ import (
 )
 
 // ─────────────────────────────────────────────
-// Token / Bootstrap types
+// Join token claims
 // ─────────────────────────────────────────────
 
 // joinClaims are the verified fields extracted from a one-time join token

@@ -5,6 +5,10 @@ import (
 	"time"
 )
 
+// ─────────────────────────────────────────────
+// Room
+// ─────────────────────────────────────────────
+
 type room struct {
 	SessionID string
 	ChannelID string
