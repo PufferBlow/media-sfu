@@ -1,4 +1,4 @@
-package main
+package sfu
 
 import (
 	"context"
@@ -220,7 +220,7 @@ func (b *stressBackend) handleEvents(w http.ResponseWriter, r *http.Request) {
 type stressHarness struct {
 	tb      testing.TB
 	backend *stressBackend
-	server  *sfuServer
+	server  *Server
 	httpSrv *httptest.Server
 }
 
@@ -230,24 +230,18 @@ func newStressHarness(tb testing.TB) *stressHarness {
 	backend := newStressBackend(tb)
 	configPath := writeStressConfig(tb, backend.server.URL, backend.bootstrapSecret)
 
-	server, err := newServer(configPath)
+	server, err := New(configPath)
 	if err != nil {
 		backend.close()
-		tb.Fatalf("newServer failed: %v", err)
+		tb.Fatalf("New failed: %v", err)
 	}
 	server.startEventWorkers()
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", server.healthz)
-	mux.HandleFunc("/readyz", server.healthz)
-	mux.HandleFunc("/metrics", server.metrics)
-	mux.HandleFunc("/rtc/v1/ws", server.handleWS)
 
 	return &stressHarness{
 		tb:      tb,
 		backend: backend,
 		server:  server,
-		httpSrv: httptest.NewServer(mux),
+		httpSrv: httptest.NewServer(server.routes()),
 	}
 }
 
@@ -627,7 +621,7 @@ func readRequestBody(r *http.Request) ([]byte, error) {
 	return io.ReadAll(r.Body)
 }
 
-func connectedPeers(server *sfuServer, sessionID string) int {
+func connectedPeers(server *Server, sessionID string) int {
 	server.roomsMu.RLock()
 	roomObj := server.rooms[sessionID]
 	server.roomsMu.RUnlock()
@@ -640,7 +634,7 @@ func connectedPeers(server *sfuServer, sessionID string) int {
 	return len(roomObj.Peers)
 }
 
-func waitForTotalPeers(server *sfuServer, expected int64, timeout time.Duration) bool {
+func waitForTotalPeers(server *Server, expected int64, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if server.totalPeers.Load() == expected {

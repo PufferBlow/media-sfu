@@ -97,13 +97,13 @@ echo "==> Running media-sfu unit tests"
 go test "${UNIT_TEST_PATTERN}"
 
 echo "==> Running media-sfu benchmark: pattern=${BENCH_PATTERN} benchtime=${BENCH_TIME}"
-go test ./cmd/server -run '^$' -bench "${BENCH_PATTERN}" -benchtime="${BENCH_TIME}"
+go test ./internal/sfu -run '^$' -bench "${BENCH_PATTERN}" -benchtime="${BENCH_TIME}"
 
 if [[ "${RUN_STRESS}" == "1" ]]; then
   echo "==> Running media-sfu stress test: clients=${STRESS_CLIENTS}"
   MEDIA_SFU_STRESS=1 \
   MEDIA_SFU_STRESS_CLIENTS="${STRESS_CLIENTS}" \
-  go test ./cmd/server -run "${STRESS_TEST_PATTERN}" -v
+  go test ./internal/sfu -run "${STRESS_TEST_PATTERN}" -v
 else
   echo "==> Skipping stress test (--stress to enable)"
 fi
@@ -114,7 +114,7 @@ if [[ "${RUN_SOAK}" == "1" ]]; then
   MEDIA_SFU_SOAK_CLIENTS="${SOAK_CLIENTS}" \
   MEDIA_SFU_SOAK_DURATION_SECONDS="${SOAK_DURATION_SECONDS}" \
   MEDIA_SFU_SOAK_HOLD_MILLISECONDS="${SOAK_HOLD_MILLISECONDS}" \
-  go test ./cmd/server -run "${SOAK_TEST_PATTERN}" -v
+  go test ./internal/sfu -run "${SOAK_TEST_PATTERN}" -v
 else
   echo "==> Skipping soak test (--soak to enable)"
 fi

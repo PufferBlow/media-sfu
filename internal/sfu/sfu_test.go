@@ -1,6 +1,7 @@
-package main
+package sfu
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -100,7 +101,7 @@ func TestDefaultSharedConfigPathPrefersHomeConfig(t *testing.T) {
 
 	setTestHome(t, tempHome)
 
-	if got := defaultSharedConfigPath(); got != configPath {
+	if got := DefaultConfigPath(); got != configPath {
 		t.Fatalf("expected home config path %q, got %q", configPath, got)
 	}
 }
@@ -110,7 +111,7 @@ func TestDefaultSharedConfigPathFallsBackToHomeCandidateWhenMissing(t *testing.T
 	setTestHome(t, tempHome)
 
 	expected := filepath.Join(tempHome, ".pufferblow", "config.toml")
-	if got := defaultSharedConfigPath(); got != expected {
+	if got := DefaultConfigPath(); got != expected {
 		t.Fatalf("expected fallback path %q, got %q", expected, got)
 	}
 }
@@ -665,7 +666,7 @@ func TestPostHeartbeatSendsSignedPayload(t *testing.T) {
 	}))
 	defer server.Close()
 
-	s := &sfuServer{
+	s := &Server{
 		internalAPIBase:    server.URL,
 		internalSecret:     secret,
 		instanceID:         "sfu-test",
@@ -701,5 +702,36 @@ func TestPostHeartbeatSendsSignedPayload(t *testing.T) {
 	}
 	if payload["max_total_peers"] != float64(100) {
 		t.Errorf("expected max_total_peers=100, got %v", payload["max_total_peers"])
+	}
+}
+
+// ─────────────────────────────────────────────
+// Serve
+// ─────────────────────────────────────────────
+
+func TestServeShutsDownWhenContextIsCancelled(t *testing.T) {
+	backend := newStressBackend(t)
+	defer backend.close()
+
+	server, err := New(writeStressConfig(t, backend.server.URL, backend.bootstrapSecret))
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	server.bindAddr = "127.0.0.1:0"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(ctx) }()
+
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("expected a clean shutdown, got %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("Serve did not return after its context was cancelled")
 	}
 }
