@@ -13,7 +13,25 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `media-sfu` is intentionally stateless and dumb about auth: it validates every join token and authorizes every event against the Pufferblow API rather than deciding anything itself. Session state lives in the Pufferblow API's database, not here.
 
-The entire server implementation lives in a single file, `cmd/server/main.go` (~2200 lines), organized into clearly commented sections (Config, Server, Room lifecycle, Track fanout, WebSocket handler, etc.) rather than split into packages. When editing, preserve that section structure (the `// ─── Section ───` banner comments) instead of introducing new files/packages unless there's a strong reason.
+## Code layout
+
+`cmd/server/main.go` is only the entry point: flag parsing and signal handling around `sfu.New` and `Server.Serve`. The server itself is the `internal/sfu` package, one file per concern:
+
+| File | What's in it |
+|---|---|
+| `server.go` | `Server` struct, `New` (load config → `newFromLocalConfig` → `fetchBootstrap` → `applyBootstrap`), `Serve` (listener + graceful shutdown), peer-slot accounting |
+| `config.go` | `[media-sfu]` TOML config, `DefaultConfigPath`, the `orString`/`orInt`/`orDuration`/`secondsOr` fallback helpers |
+| `bootstrap.go` | bootstrap-config types, the signed fetch with retry, `applyBootstrap` overrides |
+| `logging.go`, `ice.go` | logger setup; ICE server parsing and credential-masked log summaries |
+| `controlplane.go` | `postInternal` (the one signed POST to the internal API), lifecycle event queue/workers, registry heartbeat |
+| `auth.go` | `joinClaims`, `consumeJoinToken` |
+| `ws.go` | connection lifecycle: `handleWS` → `authenticate` → `admit` → `newPeer` → `joinRoom` → `announceJoin` → `keepAlive` → `readSignals` → `removePeer` |
+| `signaling.go` | `signalMessage`, the read loop, one handler per client message type |
+| `peer.go`, `room.go` | peer state; room lifecycle, end-grace timer, peer removal, broadcast |
+| `track.go`, `rtcp.go` | `roomTrack` + REMB bookkeeping and track fan-out; RTCP forwarding and its pure helpers |
+| `http.go`, `shutdown.go` | `/healthz`, `/readyz`, `/metrics` and the route table; draining peers and events on shutdown |
+
+Within a file, keep the `// ─── Section ───` banner comments. New behaviour goes in the file for its concern (or a new file in `internal/sfu` if none fits), not back into `main.go`.
 
 ## Commands
 
@@ -39,7 +57,7 @@ SOAK_CLIENTS=64 SOAK_DURATION_SECONDS=120 ./scripts/run_test.sh --soak
 BENCH_TIME=10x ./scripts/run_test.sh
 
 # Single test / targeted run
-go test ./cmd/server -run TestRewriteKeyframeRequestsRewritesPLI -v
+go test ./internal/sfu -run TestRewriteKeyframeRequestsRewritesPLI -v
 
 # Docker
 docker build -t pufferblow-media-sfu .
@@ -56,7 +74,7 @@ Config is **not** read from environment variables or CLI flags (other than `-con
 
 1. Values returned by the Pufferblow API's bootstrap endpoint (fetched at startup, see below) — these override local TOML for most fields (peer limits, event worker count, WS timeouts, UDP port range, etc.)
 2. Local `config.toml` `[media-sfu]` values
-3. Hardcoded fallback defaults in `newServer()`
+3. Hardcoded fallback defaults in `newFromLocalConfig()`
 
 `bootstrap_secret` in the local TOML is the one thing that must be present locally (it's not something the bootstrap call can provide — it's used to authenticate the bootstrap call itself). Startup fails fast if it's missing.
 
@@ -66,13 +84,13 @@ Four more static, per-deployment identity fields are also local-only (never over
 
 Pufferblow (the control plane) can run more than one `media-sfu` deployment behind it and route new voice sessions to whichever is least loaded — e.g. for geographic distribution or horizontal scaling. Each `media-sfu` instance is just another copy of this same binary with its own `region`/`public_signaling_url`/`bind_addr`; there's no separate "router" service.
 
-`startHeartbeatLoop` (started from `main()` alongside `startEventWorkers`) POSTs `{instance_id, region, signaling_url, current_peers, max_total_peers}` to the Pufferblow API's `/api/internal/v1/voice/instances/heartbeat` every `heartbeat_interval_seconds`, signed with `internal_secret` the same way `postInternalEvent` signs lifecycle events. It's a no-op (one warning log, no goroutine started) if `public_signaling_url` isn't set — a single-instance deployment doesn't need this at all, since the control plane's own hardcoded `RTC_SIGNALING_URL` fallback already works for it.
+`startHeartbeatLoop` (started from `Server.Serve` alongside `startEventWorkers`) POSTs `{instance_id, region, signaling_url, current_peers, max_total_peers}` to the Pufferblow API's `/api/internal/v1/voice/instances/heartbeat` every `heartbeat_interval_seconds`, signed with `internal_secret` through the same `postInternal` helper as lifecycle events and join-token consumption. It's a no-op (one warning log, no goroutine started) if `public_signaling_url` isn't set — a single-instance deployment doesn't need this at all, since the control plane's own hardcoded `RTC_SIGNALING_URL` fallback already works for it.
 
 The control plane marks an instance `dead` after ~30s of missed heartbeats and routes new/reconnecting sessions elsewhere; this SFU process doesn't know or care that it's been marked dead — it just keeps heartbeating, and starts getting routed new sessions again automatically once its heartbeats resume.
 
 ## Architecture: bootstrap, auth, and the control-plane relationship
 
-On startup (`newServer` → `fetchBootstrapConfigWithRetry`):
+On startup (`New` → `fetchBootstrap` → `fetchBootstrapConfigWithRetry`, then `applyBootstrap`):
 
 1. The SFU POSTs to the Pufferblow API's `/api/internal/v1/voice/bootstrap-config` endpoint, HMAC-SHA256-signed with `bootstrap_secret` (timestamp + nonce + body, see `signBootstrapPayload`). Retries with a delay (`bootstrap_max_retries` / `bootstrap_retry_delay`) since the API may not be up yet.
 2. The response (`sfuBootstrapConfig`) supplies `internal_api_base` + `internal_secret` — the credentials used for **all subsequent** internal calls back to the API — plus ICE servers, media quality profiles, and operational tuning values that override local config.
@@ -115,6 +133,6 @@ Other HTTP endpoints: `GET /healthz`, `GET /readyz` (both liveness/readiness, sa
 
 ## Testing notes
 
-- `cmd/server/main_test.go` — unit tests for pure/testable logic: TOML config loading, HMAC signing, ICE server parsing/log-masking, RTCP rewriting (PLI/FIR), REMB aggregation and throttling logic on `roomTrack`.
-- `cmd/server/stress_test.go` — `BenchmarkMediaSFUSignalingJoin`, plus opt-in `TestMediaSFUSignalingStress` / `TestMediaSFUSignalingSoak`, gated behind `MEDIA_SFU_STRESS=1` / `MEDIA_SFU_SOAK=1` env vars (set automatically by `scripts/run_test.sh --stress`/`--soak`). These exercise the signaling path and control-plane event flow at scale; they do **not** simulate sustained real RTP media bandwidth across peer streams, so they won't catch media-forwarding regressions.
+- `internal/sfu/sfu_test.go` — unit tests for pure/testable logic: TOML config loading and fallback helpers, HMAC signing, ICE server parsing/log-masking, RTCP rewriting (PLI/FIR), REMB aggregation and throttling logic on `roomTrack`, the heartbeat payload, and `Serve` shutting down on context cancel.
+- `internal/sfu/stress_test.go` — `BenchmarkMediaSFUSignalingJoin`, plus opt-in `TestMediaSFUSignalingStress` / `TestMediaSFUSignalingSoak`, gated behind `MEDIA_SFU_STRESS=1` / `MEDIA_SFU_SOAK=1` env vars (set automatically by `scripts/run_test.sh --stress`/`--soak`). These exercise the signaling path and control-plane event flow at scale; they do **not** simulate sustained real RTP media bandwidth across peer streams, so they won't catch media-forwarding regressions.
 - When touching REMB/PLI/FIR logic, the pure-logic helpers (`rewriteKeyframeRequests`, `extractMaxBitrateBPS`, `roomTrack.shouldForwardREMB`) are intentionally extracted so they're testable without a live `pion` `RTPSender`/connection — keep new RTCP logic in that shape rather than burying it inline in `forwardReceiverRTCP`.
