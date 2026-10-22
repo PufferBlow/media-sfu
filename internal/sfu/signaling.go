@@ -131,12 +131,23 @@ func (s *Server) handleOffer(roomObj *room, peerObj *peer, offer *webrtc.Session
 		_ = peerObj.send(signalMessage{Type: "error", Error: "offer is null"})
 		return
 	}
+	// Both sides can offer at the same moment (the SFU offers when it adds a track). The SFU holds its
+	// own offer: the client is told to roll back, answers it, and sends its offer again afterwards.
+	// Dropping this one is not an error, so the client is not told it is.
+	defer s.renegotiateIfNeeded(peerObj) // runs after the lock below is released
+	peerObj.negMu.Lock()
+	defer peerObj.negMu.Unlock()
+	if peerObj.PC.SignalingState() != webrtc.SignalingStateStable {
+		s.log.Debug("ignoring client offer: an offer of ours is unanswered", "user_id", peerObj.UserID)
+		return
+	}
 	if err := peerObj.PC.SetRemoteDescription(*offer); err != nil {
 		s.log.Warn("failed to apply offer",
 			"user_id", peerObj.UserID, "err", err)
 		_ = peerObj.send(signalMessage{Type: "error", Error: "failed to apply offer"})
 		return
 	}
+	s.flushCandidates(peerObj)
 	answer, err := peerObj.PC.CreateAnswer(nil)
 	if err != nil {
 		s.log.Warn("failed to create answer",
@@ -168,17 +179,44 @@ func (s *Server) handleAnswer(peerObj *peer, answer *webrtc.SessionDescription) 
 		s.log.Warn("failed to apply answer",
 			"user_id", peerObj.UserID, "err", err)
 		_ = peerObj.send(signalMessage{Type: "error", Error: "failed to apply answer"})
+		return
 	}
+	s.flushCandidates(peerObj)
+	// A track may have been added while this offer was out; offer again for it.
+	s.renegotiateIfNeeded(peerObj)
 }
 
+// handleCandidate adds a candidate from the client. Candidates can arrive before the offer they belong
+// to (the client trickles them as it gathers), so they wait until the remote description is set.
 func (s *Server) handleCandidate(peerObj *peer, candidate *webrtc.ICECandidateInit) {
 	if candidate == nil {
 		return
 	}
-	if err := peerObj.PC.AddICECandidate(*candidate); err != nil {
+	peerObj.candMu.Lock()
+	if peerObj.PC.RemoteDescription() == nil {
+		peerObj.pendingCandidates = append(peerObj.pendingCandidates, *candidate)
+		peerObj.candMu.Unlock()
+		return
+	}
+	peerObj.candMu.Unlock()
+	s.addCandidate(peerObj, *candidate)
+}
+
+func (s *Server) addCandidate(peerObj *peer, candidate webrtc.ICECandidateInit) {
+	if err := peerObj.PC.AddICECandidate(candidate); err != nil {
 		s.log.Warn("failed to add ICE candidate",
 			"user_id", peerObj.UserID, "err", err)
-		_ = peerObj.send(signalMessage{Type: "error", Error: "failed to add ICE candidate"})
+	}
+}
+
+// flushCandidates applies the candidates that arrived early.
+func (s *Server) flushCandidates(peerObj *peer) {
+	peerObj.candMu.Lock()
+	queued := peerObj.pendingCandidates
+	peerObj.pendingCandidates = nil
+	peerObj.candMu.Unlock()
+	for _, candidate := range queued {
+		s.addCandidate(peerObj, candidate)
 	}
 }
 

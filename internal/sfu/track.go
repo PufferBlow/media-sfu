@@ -137,6 +137,25 @@ func (s *Server) addTrackToPeer(target *peer, rt *roomTrack) error {
 	// threaded through so REMB reports can be aggregated per publisher.
 	go s.forwardReceiverRTCP(sender, rt, target.UserID)
 
+	return s.negotiate(target)
+}
+
+// negotiate sends the peer an offer for whatever has been added to its connection, unless an offer
+// of ours is still waiting for its answer. In that case it only notes that another round is needed;
+// handleAnswer starts it. This keeps offers from overlapping when several tracks are fanned out to
+// one peer at the same moment.
+func (s *Server) negotiate(target *peer) error {
+	target.negMu.Lock()
+	defer target.negMu.Unlock()
+
+	// The client makes the first offer (so it also settles the DTLS roles); until it has, and while an
+	// offer of ours is out, the tracks just wait on the connection and are offered in the next round.
+	if target.PC.RemoteDescription() == nil || target.PC.SignalingState() != webrtc.SignalingStateStable {
+		target.renegotiate = true
+		return nil
+	}
+	target.renegotiate = false
+
 	offer, err := target.PC.CreateOffer(nil)
 	if err != nil {
 		return err
@@ -149,6 +168,19 @@ func (s *Server) addTrackToPeer(target *peer, rt *roomTrack) error {
 		SessionID: target.SessionID,
 		Offer:     &offer,
 	})
+}
+
+// renegotiateIfNeeded runs the round negotiate deferred, once the connection is stable again.
+func (s *Server) renegotiateIfNeeded(target *peer) {
+	target.negMu.Lock()
+	needed := target.renegotiate
+	target.negMu.Unlock()
+	if !needed {
+		return
+	}
+	if err := s.negotiate(target); err != nil {
+		s.log.Warn("renegotiation failed", "user_id", target.UserID, "err", err)
+	}
 }
 
 // handleRemoteTrack proxies RTP from a source peer to all other peers in the room.

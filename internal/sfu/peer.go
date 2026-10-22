@@ -45,6 +45,15 @@ type peer struct {
 
 	WriteTimeout time.Duration
 
+	// Negotiation state. The SFU offers whenever a track is added to the peer, and several tracks can
+	// arrive at once, so offers are sent one at a time (negMu) and a request that comes in while one is
+	// unanswered is remembered (renegotiate) and sent when the answer lands.
+	negMu       sync.Mutex
+	renegotiate bool
+	// ICE candidates that arrived before the remote description they belong to; applied once it is set.
+	candMu            sync.Mutex
+	pendingCandidates []webrtc.ICECandidateInit
+
 	// State fields — guarded by stateMu, NOT the room lock.
 	// Separating this mutex avoids holding the room lock during snapshot
 	// iteration while audio_state messages are being processed concurrently.
