@@ -189,9 +189,16 @@ func (s *Server) newPeer(conn *websocket.Conn, claims *joinClaims, roomObj *room
 		)
 		switch state {
 		case webrtc.PeerConnectionStateFailed,
-			webrtc.PeerConnectionStateClosed,
-			webrtc.PeerConnectionStateDisconnected:
+			webrtc.PeerConnectionStateClosed:
 			s.removePeer(roomObj, peerObj, state.String())
+		case webrtc.PeerConnectionStateDisconnected:
+			// Disconnected is a pause, not an end: a busy machine or a changing network often comes back on
+			// its own (pion moves on to Failed if it does not). Give it a moment before dropping the person.
+			time.AfterFunc(disconnectGrace, func() {
+				if pc.ConnectionState() == webrtc.PeerConnectionStateDisconnected {
+					s.removePeer(roomObj, peerObj, state.String())
+				}
+			})
 		case webrtc.PeerConnectionStateConnected:
 			s.log.Info("peer WebRTC connected",
 				"user_id", peerObj.UserID,
@@ -234,6 +241,9 @@ func (s *Server) newPeer(conn *websocket.Conn, claims *joinClaims, roomObj *room
 
 	return peerObj, nil
 }
+
+// disconnectGrace is how long a connection may stay Disconnected before the person is removed from the room.
+const disconnectGrace = 10 * time.Second
 
 // joinRoom registers the peer in the room, re-checking capacity under the
 // room lock (the authoritative check), and returns the tracks already live

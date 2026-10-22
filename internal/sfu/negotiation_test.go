@@ -220,3 +220,48 @@ func TestHeldCandidatesAreCapped(t *testing.T) {
 		t.Fatal("an oversized candidate should be dropped, not held")
 	}
 }
+
+func TestAStaleConnectionCannotRemoveTheNewOneAfterARejoin(t *testing.T) {
+	oldRig := newNegotiationRig(t)
+	newRig := newNegotiationRig(t)
+	oldRig.peer.UserID, newRig.peer.UserID = "bob", "bob"
+	oldRig.room.Peers["bob"] = newRig.peer // bob left and rejoined: the room holds his new connection
+
+	oldRig.s.removePeer(oldRig.room, oldRig.peer, "closed") // the old connection's late callback
+
+	if oldRig.room.Peers["bob"] != newRig.peer {
+		t.Fatal("the old connection's cleanup took the rejoined peer out of the room")
+	}
+	if newRig.peer.PC.ConnectionState() == webrtc.PeerConnectionStateClosed {
+		t.Fatal("the rejoined peer's connection was closed")
+	}
+	if oldRig.peer.PC.ConnectionState() != webrtc.PeerConnectionStateClosed {
+		t.Fatal("the stale connection should still be shut")
+	}
+}
+
+func TestUDP4OnlySwitch(t *testing.T) {
+	for _, on := range []string{"1", "true", "YES", " on "} {
+		if !udp4Only(on) {
+			t.Fatalf("%q should switch IPv4-only on", on)
+		}
+	}
+	for _, off := range []string{"", "0", "false", "no", "maybe"} {
+		if udp4Only(off) {
+			t.Fatalf("%q should leave IPv6 enabled", off)
+		}
+	}
+}
+
+func TestLoopbackInterfaceNames(t *testing.T) {
+	for _, name := range []string{"lo", "lo0", "Loopback Pseudo-Interface 1"} {
+		if !isLoopbackInterface(name) {
+			t.Fatalf("%q is a loopback interface", name)
+		}
+	}
+	for _, name := range []string{"eth0", "Wi-Fi", "vEthernet (WSL)"} {
+		if isLoopbackInterface(name) {
+			t.Fatalf("%q is not a loopback interface", name)
+		}
+	}
+}

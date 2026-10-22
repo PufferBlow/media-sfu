@@ -133,7 +133,10 @@ func (s *Server) scheduleRoomEndGrace(r *room) {
 
 func (s *Server) removePeer(r *room, p *peer, reason string) {
 	r.Mu.Lock()
-	_, exists := r.Peers[p.UserID]
+	// Only this exact connection may be removed. A person who leaves and rejoins quickly has a new peer
+	// under the same user id, and the old connection's late callbacks must not take the new one out.
+	current, registered := r.Peers[p.UserID]
+	exists := registered && current == p
 	if exists {
 		delete(r.Peers, p.UserID)
 	}
@@ -143,6 +146,9 @@ func (s *Server) removePeer(r *room, p *peer, reason string) {
 	if !exists {
 		// Already removed — removePeer is called from both OnConnectionStateChange
 		// (multiple states can fire) and the read-loop exit. Only the first call acts.
+		// A stale connection is still shut, so nothing of it lingers.
+		_ = p.PC.Close()
+		_ = p.WS.Close()
 		return
 	}
 

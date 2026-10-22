@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -175,7 +176,36 @@ func newWebRTCAPI(minUDP, maxUDP int, logger *slog.Logger) *webrtc.API {
 			logger.Info("UDP port range configured", "min", minUDP, "max", maxUDP)
 		}
 	}
+	if udp4Only(os.Getenv("MEDIA_SFU_UDP4_ONLY")) {
+		// A host with a global IPv6 address can offer pairs between its own addresses that work for a few
+		// seconds and then stall; operators who see that can switch the media plane to IPv4.
+		se.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
+		logger.Info("media-sfu is using IPv4 only (MEDIA_SFU_UDP4_ONLY)")
+	}
+	if udp4Only(os.Getenv("MEDIA_SFU_LOOPBACK_ONLY")) {
+		// For labs and tests where every client is on this machine: offer only the loopback address, so a
+		// host with several adapters (LAN, VPN, WSL) cannot nominate a pair between its own addresses.
+		se.SetIncludeLoopbackCandidate(true)
+		se.SetInterfaceFilter(isLoopbackInterface)
+		se.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
+		logger.Info("media-sfu offers loopback candidates only (MEDIA_SFU_LOOPBACK_ONLY)")
+	}
 	return webrtc.NewAPI(webrtc.WithSettingEngine(se))
+}
+
+// isLoopbackInterface says whether a network interface name is the loopback one ("lo", "lo0", "Loopback Pseudo-Interface 1").
+func isLoopbackInterface(name string) bool {
+	lower := strings.ToLower(name)
+	return lower == "lo" || lower == "lo0" || strings.Contains(lower, "loopback")
+}
+
+// udp4Only reads the MEDIA_SFU_UDP4_ONLY switch: 1, true, yes or on.
+func udp4Only(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 func (s *Server) logStartup(logLevel string) {
