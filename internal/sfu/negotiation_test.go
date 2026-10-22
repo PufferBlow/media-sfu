@@ -205,3 +205,18 @@ func TestCandidatesBeforeTheOfferWaitAndAreAppliedAfter(t *testing.T) {
 		t.Fatal("held candidates should be applied once the offer is in")
 	}
 }
+
+func TestHeldCandidatesAreCapped(t *testing.T) {
+	rig := newNegotiationRig(t)
+	for i := 0; i < maxPendingCandidates+40; i++ {
+		rig.s.handleCandidate(rig.peer, &webrtc.ICECandidateInit{Candidate: "candidate:1 1 udp 2130706431 127.0.0.1 50000 typ host"})
+	}
+	if got := len(rig.peer.pendingCandidates); got != maxPendingCandidates {
+		t.Fatalf("expected %d held candidates, have %d", maxPendingCandidates, got)
+	}
+
+	rig.s.handleCandidate(rig.peer, &webrtc.ICECandidateInit{Candidate: strings.Repeat("x", maxCandidateBytes+1)})
+	if got := len(rig.peer.pendingCandidates); got != maxPendingCandidates {
+		t.Fatal("an oversized candidate should be dropped, not held")
+	}
+}

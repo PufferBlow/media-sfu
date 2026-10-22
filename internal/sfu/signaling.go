@@ -186,15 +186,30 @@ func (s *Server) handleAnswer(peerObj *peer, answer *webrtc.SessionDescription) 
 	s.renegotiateIfNeeded(peerObj)
 }
 
+// Limits on candidates held before the client's offer. A real browser gathers a few dozen at most.
+const (
+	maxPendingCandidates = 64
+	maxCandidateBytes    = 1024
+)
+
 // handleCandidate adds a candidate from the client. Candidates can arrive before the offer they belong
 // to (the client trickles them as it gathers), so they wait until the remote description is set.
 func (s *Server) handleCandidate(peerObj *peer, candidate *webrtc.ICECandidateInit) {
 	if candidate == nil {
 		return
 	}
+	if len(candidate.Candidate) > maxCandidateBytes {
+		s.log.Warn("dropping oversized ICE candidate", "user_id", peerObj.UserID, "bytes", len(candidate.Candidate))
+		return
+	}
 	peerObj.candMu.Lock()
 	if peerObj.PC.RemoteDescription() == nil {
-		peerObj.pendingCandidates = append(peerObj.pendingCandidates, *candidate)
+		// A client that never sends its offer must not be able to grow this without bound.
+		if len(peerObj.pendingCandidates) < maxPendingCandidates {
+			peerObj.pendingCandidates = append(peerObj.pendingCandidates, *candidate)
+		} else {
+			s.log.Warn("dropping ICE candidate: too many held before the offer", "user_id", peerObj.UserID)
+		}
 		peerObj.candMu.Unlock()
 		return
 	}
