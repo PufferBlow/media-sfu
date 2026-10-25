@@ -126,10 +126,16 @@ func (rt *roomTrack) shouldForwardREMB(aggregate uint64, now time.Time) bool {
 // ─────────────────────────────────────────────
 
 func (s *Server) addTrackToPeer(target *peer, rt *roomTrack) error {
+	// Adding the track and deciding whether to offer happen under one hold of negMu, so a track added
+	// while another goroutine is mid-offer is never missed by both rounds.
+	target.negMu.Lock()
 	sender, err := target.PC.AddTrack(rt.Local)
 	if err != nil {
+		target.negMu.Unlock()
 		return err
 	}
+	err = s.negotiateLocked(target)
+	target.negMu.Unlock()
 	// Drain RTCP from the receiver and forward picture-loss feedback back to
 	// the publisher so video can recover after packet loss. Without this the
 	// sender would stall (drain is required by pion) AND receivers asking for
@@ -137,7 +143,7 @@ func (s *Server) addTrackToPeer(target *peer, rt *roomTrack) error {
 	// threaded through so REMB reports can be aggregated per publisher.
 	go s.forwardReceiverRTCP(sender, rt, target.UserID)
 
-	return s.negotiate(target)
+	return err
 }
 
 // negotiate sends the peer an offer for whatever has been added to its connection, unless an offer
@@ -147,6 +153,11 @@ func (s *Server) addTrackToPeer(target *peer, rt *roomTrack) error {
 func (s *Server) negotiate(target *peer) error {
 	target.negMu.Lock()
 	defer target.negMu.Unlock()
+	return s.negotiateLocked(target)
+}
+
+// negotiateLocked is negotiate for a caller already holding target.negMu.
+func (s *Server) negotiateLocked(target *peer) error {
 
 	// The client makes the first offer (so it also settles the DTLS roles); until it has, and while an
 	// offer of ours is out, the tracks just wait on the connection and are offered in the next round.
