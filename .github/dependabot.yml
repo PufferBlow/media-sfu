@@ -1,0 +1,41 @@
+# Dependabot: version updates and security updates.
+# Reference: https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+#
+# Security updates (fixes for a published advisory) are raised by Dependabot itself and are not held back
+# by the schedule or by the pull request limit. Turn on "Dependabot alerts" and "Dependabot security
+# updates" under Settings > Code security; this file shapes the routine version updates and their grouping.
+
+version: 2
+updates:
+  # Go modules (go.mod, go.sum). Checked daily so the fix for a new advisory is proposed quickly.
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "go"
+    commit-message:
+      prefix: "build(deps)"
+    groups:
+      go-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+      go-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  # The container image's base image.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "docker"
+    commit-message:
+      prefix: "build(docker)"
