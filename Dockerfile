@@ -6,7 +6,7 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/media-sfu ./cmd/server
 
-FROM alpine:3.21
+FROM alpine:3.24
 RUN adduser -D -H appuser
 USER appuser
 WORKDIR /
